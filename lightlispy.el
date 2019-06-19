@@ -44,6 +44,15 @@
 (defvar lightlispy-ignore-whitespace nil
   "When set to t, function `lightlispy-right' will not clean up whitespace.")
 
+(defvar lightlispy-outline "^;;\\(?:;[^#]\\|\\*+\\)"
+  "Outline delimiter.")
+
+(defvar lightlispy-left "[([{]"
+  "Opening delimiter.")
+
+(defvar lightlispy-right "[])}]"
+  "Closing delimiter.")
+
 (defvar-local lightlispy-outline-header ";;"
   "Store the buffer-local outline start.")
 
@@ -55,6 +64,16 @@
   "Return t if after variable `lightlispy-right'."
   (looking-back lightlispy-right
                 (line-beginning-position)))
+
+(defsubst lightlispy-left-p ()
+  "Return t if before variable `lightlispy-left'."
+  (looking-at lightlispy-left))
+
+(defun lightlispy-bolp ()
+  "Return t if point is at beginning of line, after optional spaces."
+  (save-excursion
+    (skip-chars-backward " \t")
+    (bolp)))
 
 (defmacro lightlispy-dotimes (n &rest bodyform)
   "Execute N times the BODYFORM unless an error is signaled.
@@ -88,7 +107,7 @@ Otherwise return the amount of times executed."
       (forward-char 1))
     (nth 4 (syntax-ppss))))
 
-(defun lispy--in-string-or-comment-p ()
+(defun lightlispy--in-string-or-comment-p ()
   "Test if point is inside a string or a comment."
   (let* ((sp (syntax-ppss))
          (beg (nth 8 sp)))
@@ -96,11 +115,14 @@ Otherwise return the amount of times executed."
               (nth 4 sp))
       beg)))
 
-(defun lispy--exit-string ()
-  "When in string, go to its beginning."
-  (let ((s (syntax-ppss)))
-    (when (nth 3 s)
-      (goto-char (nth 8 s)))))
+(defun lightlispy--ensure-visible ()
+  "Remove overlays hiding point."
+  (let ((overlays (overlays-at (point)))
+        ov expose)
+    (while (setq ov (pop overlays))
+      (if (and (invisible-p (overlay-get ov 'invisible))
+               (setq expose (overlay-get ov 'isearch-open-invisible)))
+          (funcall expose ov)))))
 
 (defun lightlispy--out-forward (arg)
   "Move outside list forwards ARG times.
@@ -211,5 +233,74 @@ otherwise call function `lightlispy-right' and return nil."
         (prog1 nil
           (lightlispy--out-forward 1))
       (point))))
+
+(defun lightlispy--insert-or-call (def plist)
+  "Return a lambda to call DEF if position is special.
+Otherwise call `self-insert-command'.
+PLIST currently accepts:
+- :disable with a mode to disable
+- :override with a lambda to conditionally abort command"
+  (let ((disable (plist-get plist :disable))
+        (override (plist-get plist :override))
+        (inserter (plist-get plist :inserter)))
+    `(lambda ()
+       ,(format "Call `%s' when special, self-insert otherwise.\n\n%s"
+                (symbol-name def) (documentation def))
+       (interactive)
+       ,@(when disable `((,disable -1)))
+       (unless (looking-at lightlispy-outline)
+         (lightlispy--ensure-visible))
+       (cond ,@(cond ((null override) nil)
+                     ((functionp override)
+                      `((funcall ,override)))
+                     ((eq (car override) 'cond)
+                      (cdr override))
+                     (t
+                      (error "Unexpected :override %S" override)))
+
+             ((region-active-p)
+              (call-interactively ',def))
+
+             ((lightlispy--in-string-or-comment-p)
+              (setq this-command 'self-insert-command)
+              (call-interactively 'self-insert-command))
+
+             ((or (lightlispy-left-p)
+                  (lightlispy-right-p)
+                  (and (lightlispy-bolp)
+                       (or (looking-at lightlispy-outline-header)
+                           (looking-at lightlispy-outline))))
+              (call-interactively ',def))
+
+             (t
+              (setq this-command 'self-insert-command)
+              (call-interactively
+               (quote
+                ,(or inserter
+                     'self-insert-command))))))))
+
+(defun lightlispy-define-key (keymap key def &rest plist)
+  "Forward to (`define-key' KEYMAP KEY FUNC).
+FUNC is obtained from (`lightlispy--insert-or-call' DEF PLIST)."
+  (declare (indent 3))
+  (let ((func (defalias (intern (concat "special-" (symbol-name def)))
+                (lightlispy--insert-or-call def plist))))
+    (define-key keymap (kbd key) func)))
+
+(defvar lightlispy-mode-map (make-sparse-keymap))
+(defvar lightlispy-mode-map-special
+  (let ((map (make-sparse-keymap)))
+    (lightlispy-define-key map "]" 'lightlispy-forward)
+    map))
+
+;; !!!! TODO -> Someday we might want to add the themes
+(setq lightlispy-mode-map lightlispy-mode-map-special)
+
+(define-minor-mode lightlispy-mode
+  "A light version of lispy-mode - focusing only on structural editing
+for lisps."
+  :keymap lightlispy-mode-map
+  :group 'lightlispy
+  :lighter "LLY")
 
 ;;; orgext.el ends here
