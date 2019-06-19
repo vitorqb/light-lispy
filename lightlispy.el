@@ -1,4 +1,4 @@
-;;; light-lispy.el --- Light Lispy -*- lexical-binding: t -*-
+;;; lightlispy.el --- Light Lispy -*- lexical-binding: t -*-
 
 ;; Copyright (C) 2019 -
 
@@ -7,7 +7,7 @@
 ;; Maintainer: Vitor <vitorqb@gmail.com>
 ;; Created: 2019-06-18
 ;; Keywords: lispy structural-editting
-;; Homepage: https://github.com/vitorqb/light-lispy
+;; Homepage: https://github.com/vitorqb/lightlispy
 
 ;; This file is not part of GNU Emacs
 
@@ -56,6 +56,16 @@
 (defvar-local lightlispy-outline-header ";;"
   "Store the buffer-local outline start.")
 
+(defvar lightlispy-pos-ring (make-ring 100)
+  "Ring for point and mark position history.")
+
+(defcustom lightlispy-verbose t
+  "If t, lightlispy will display some messages on error state.
+These messages are similar to \"Beginning of buffer\" error for
+`backward-char' and can safely be ignored."
+  :type 'boolean
+  :group 'lightlispy)
+
 (defsubst lightlispy-looking-back (regexp)
   "Forward to (`looking-back' REGEXP)."
   (looking-back regexp (line-beginning-position)))
@@ -69,11 +79,8 @@
   "Return t if before variable `lightlispy-left'."
   (looking-at lightlispy-left))
 
-(defun lightlispy-bolp ()
-  "Return t if point is at beginning of line, after optional spaces."
-  (save-excursion
-    (skip-chars-backward " \t")
-    (bolp)))
+;; Should we keep this?
+(declare-function lightlispy-bounds-python-block "le-python")
 
 (defmacro lightlispy-dotimes (n &rest bodyform)
   "Execute N times the BODYFORM unless an error is signaled.
@@ -93,6 +100,19 @@ Otherwise return the amount of times executed."
             (message "Buffer is read-only: %s" (current-buffer)))
           (cl-decf i)
           (and (> i 0) i))))))
+
+
+(defun lightlispy-bolp ()
+  "Return t if point is at beginning of line, after optional spaces."
+  (save-excursion
+    (skip-chars-backward " \t")
+    (bolp)))
+
+(defun lightlispy--mark (bnd)
+  "Mark BND.  BND is a cons of beginning and end positions."
+  (setq deactivate-mark nil)
+  (set-mark (car bnd))
+  (goto-char (cdr bnd)))
 
 (defun lightlispy--exit-string ()
   "When in string, go to its beginning."
@@ -123,6 +143,81 @@ Otherwise return the amount of times executed."
       (if (and (invisible-p (overlay-get ov 'invisible))
                (setq expose (overlay-get ov 'isearch-open-invisible)))
           (funcall expose ov)))))
+
+(defun lightlispy-complain (msg)
+  "Display MSG if `lightlispy-verbose' is t."
+  (when (and lightlispy-verbose (null noninteractive))
+    (message "%s: %s"
+             (propertize
+              (prin1-to-string
+               this-command)
+              'face 'font-lock-keyword-face)
+             msg)
+    nil))
+
+(defun lightlispy--skip-delimiter-preceding-syntax-backward ()
+  "Move backwards past syntax that could precede an opening delimiter such as '.
+Specifically, move backwards to the closest whitespace char or opening delimiter
+or to the beginning of the line."
+  (re-search-backward (concat "[[:space:]]" "\\|"
+                              lightlispy-left "\\|"
+                              "^"))
+  (goto-char (match-end 0)))
+
+(defun lightlispy-different ()
+  "Switch to the different side of current sexp."
+  (interactive)
+  (cond ((and (region-active-p)
+              (not (= (region-beginning) (region-end))))
+         (exchange-point-and-mark))
+        ((lightlispy-right-p)
+         (backward-list))
+        ((lightlispy-left-p)
+         (forward-list))
+        (t
+         (user-error "Unexpected"))))
+
+(defun lightlispy-right (arg)
+  "Move outside list forwards ARG times.
+Return nil on failure, t otherwise."
+  (interactive "p")
+  (lightlispy--remember)
+  (when (bound-and-true-p abbrev-mode)
+    (ignore-errors (expand-abbrev)))
+  (cond ((region-active-p)
+         (lightlispy-mark-right arg))
+        ((looking-at lightlispy-outline)
+         (lightlispy-outline-right))
+        (t
+         (lightlispy--out-forward arg))))
+
+(defun lightlispy-left (arg)
+  "Move outside list forwards ARG times.
+Return nil on failure, t otherwise."
+  (interactive "p")
+  (lightlispy--remember)
+  (cond ((region-active-p)
+         (lightlispy-mark-left arg))
+        ((looking-at lightlispy-outline)
+         (lightlispy-outline-left))
+        (t
+         (or (lispy--out-backward arg)
+             (ignore-errors
+               (up-list -1))))))
+
+(defun lightlispy--bounds-string ()
+  "Return bounds of current string."
+  (unless (lightlispy--in-comment-p)
+    (let ((beg (or (nth 8 (syntax-ppss))
+                   (and (eq (char-after (point)) ?\")
+                        (not (eq ?\\ (char-before)))
+                        (point)))))
+      (when (and beg (not (comment-only-p beg (1+ (point)))))
+        (ignore-errors
+          (cons beg (save-excursion
+                      (goto-char beg)
+                      (forward-sexp)
+                      (point))))))))
 
 (defun lightlispy--out-forward (arg)
   "Move outside list forwards ARG times.
@@ -158,6 +253,23 @@ Return nil on failure, (point) otherwise."
       (delete-region (match-beginning 1)
                      (match-end 1)))))
 
+(defun lightlispy--remember ()
+  "Store the current point and mark in history."
+  (let* ((emptyp (zerop (ring-length lightlispy-pos-ring)))
+         (top (unless emptyp
+                (ring-ref lightlispy-pos-ring 0))))
+    (if (region-active-p)
+        (let* ((bnd (lightlispy--bounds-dwim))
+               (bnd (cons
+                     (move-marker (make-marker) (car bnd))
+                     (move-marker (make-marker) (cdr bnd)))))
+          (when (or emptyp
+                    (not (equal bnd top)))
+            (ring-insert lightlispy-pos-ring bnd)))
+      (when (or emptyp
+                (not (equal (point-marker) top)))
+        (ring-insert lightlispy-pos-ring (point-marker))))))
+
 (defun lightlispy--beginning-of-comment ()
   "Go to beginning of comment on current line."
   (end-of-line)
@@ -169,13 +281,69 @@ Return nil on failure, (point) otherwise."
      (and (looking-at (concat "^" lightlispy-outline-header))
           (point)))))
 
+(defun lightlispy-outline-left ()
+  "Move left."
+  (interactive)
+  (when (looking-at lightlispy-outline)
+    (lightlispy--remember)
+    (let ((level-up (1- (funcall outline-level))))
+      (when (> level-up 0)
+        (re-search-backward (format "^#\\*\\{1,%d\\} " level-up) nil t)))))
+
+(defun lightlispy-outline-right ()
+  "Move right."
+  (interactive)
+  (let ((pt (point))
+        result)
+    (save-restriction
+      (org-narrow-to-subtree)
+      (forward-char)
+      (if (re-search-forward lightlispy-outline nil t)
+          (progn
+            (goto-char (match-beginning 0))
+            (setq result t))
+        (goto-char pt)))
+    (lightlispy--ensure-visible)
+    result))
+
+(defun lightlispy-mark-left (arg)
+  "Go left ARG times and mark."
+  (interactive "p")
+  (if (lightlispy-mark-right arg)
+      (lightlispy-different)
+    (when (= (point) (region-end))
+      (exchange-point-and-mark))))
+
+(defun lightlispy-mark-right (arg)
+  "Go right ARG times and mark."
+  (interactive "p")
+  (let* ((pt (point))
+         (mk (mark))
+         (lightlispy-ignore-whitespace t)
+         (r (lightlispy--out-forward arg)))
+    (deactivate-mark)
+    (if (or (= pt (point))
+            (= mk (point))
+            (and (region-active-p)
+                 (= (region-beginning)
+                    (region-end))))
+        (progn
+          (lightlispy-complain "can't go any further")
+          (if (> mk pt)
+              (lightlispy--mark (cons pt mk))
+            (lightlispy--mark (cons mk pt)))
+          nil)
+      (lightlispy--mark
+       (lightlispy--bounds-dwim))
+      r)))
+
 (defun lightlispy--bounds-comment ()
   "Return bounds of current comment."
   (and (lightlispy--in-comment-p)
        (save-excursion
          (when (lightlispy--beginning-of-comment)
            (let ((pt (point)))
-             (while (and (light-lispy--in-comment-p)
+             (while (and (lightlispy--in-comment-p)
                          (forward-comment -1)
                          (lightlispy-looking-back "^[[:space:]]*")
                          (= 1 (- (count-lines (point) pt)
@@ -279,6 +447,75 @@ PLIST currently accepts:
                 ,(or inserter
                      'self-insert-command))))))))
 
+(defun lightlispy--bounds-dwim ()
+  "Return a cons of region bounds if it's active.
+Otherwise return cons of current string, symbol or list bounds."
+  (let (bnd)
+    (cond ((region-active-p)
+           (cons (region-beginning)
+                 (region-end)))
+          ((and (setq bnd (lightlispy--bounds-string))
+                (or (eq (point) (car bnd))
+                    (eq (point) (1- (cdr bnd)))))
+           bnd)
+          ((looking-at lightlispy-outline)
+           (save-excursion
+             (cons
+              (progn
+                (outline-end-of-heading)
+                (1+ (point)))
+              (progn
+                (outline-end-of-subtree)
+                (skip-chars-backward "\n")
+                (when (setq bnd (lightlispy--bounds-comment))
+                  (goto-char (1- (car bnd))))
+                (point)))))
+          ((save-excursion
+             (when (lightlispy-right-p)
+               (backward-list))
+             (and (or (looking-at (concat "[^[:space:]\n]*" lightlispy-left))
+                      (looking-at "[`'#]"))
+                  (setq bnd (bounds-of-thing-at-point 'sexp))))
+           (save-excursion
+             (goto-char (car bnd))
+             (lightlispy--skip-delimiter-preceding-syntax-backward)
+             (cons (point) (cdr bnd))))
+          ((looking-at ";;")
+           (lightlispy--bounds-comment))
+          ;; !!!! TODO Should we keep this?
+          ((and (eq major-mode 'python-mode)
+                (lightlispy-bolp))
+           (lightlispy-bounds-python-block))
+          (t
+           (let ((res (ignore-errors
+                        (bounds-of-thing-at-point
+                         (if (looking-at lightlispy-right)
+                             'symbol
+                           'sexp)))))
+             (if res
+                 (save-excursion
+                   (goto-char (cdr res))
+                   (lightlispy--in-string-or-comment-p)
+                   (skip-chars-backward "[.,]")
+                   (cons (car res) (point)))
+               (or
+                (ignore-errors
+                  (bounds-of-thing-at-point 'symbol))
+                (and (lightlispy-looking-back "\" *")
+                     (save-excursion
+                       (goto-char (match-beginning 0))
+                       (lightlispy--bounds-string)))
+                (ignore-errors
+                  (bounds-of-thing-at-point 'sentence))
+                (ignore-errors
+                  (save-excursion
+                    (backward-word 1)
+                    (bounds-of-thing-at-point 'symbol)))
+                (ignore-errors
+                  (save-excursion
+                    (forward-word 1)
+                    (bounds-of-thing-at-point 'symbol))))))))))
+
 (defun lightlispy-define-key (keymap key def &rest plist)
   "Forward to (`define-key' KEYMAP KEY FUNC).
 FUNC is obtained from (`lightlispy--insert-or-call' DEF PLIST)."
@@ -290,6 +527,8 @@ FUNC is obtained from (`lightlispy--insert-or-call' DEF PLIST)."
 (defvar lightlispy-mode-map (make-sparse-keymap))
 (defvar lightlispy-mode-map-special
   (let ((map (make-sparse-keymap)))
+    (lightlispy-define-key map "l" 'lightlispy-right)
+    (lightlispy-define-key map "h" 'lightlispy-left)
     (lightlispy-define-key map "]" 'lightlispy-forward)
     map))
 
