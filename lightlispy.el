@@ -116,6 +116,39 @@ modes is in this list.")
     table)
   "Syntax table for paired braces.")
 
+(defvar lightlispy-delete-sexp-from-within nil
+  "When cursor is adjacent to an opening or closing pair,
+`lightlispy-delete' or `lightlispy-delete-backward' toward the delimiter
+will kill the whole sexp (string or list).")
+
+(defvar lightlispy-delete-backward-recenter -20
+  "When cursor is near top of screen when calling
+  `lightlispy-delete-backward', recenter cursor with arg.")
+
+(defcustom lightlispy-safe-actions-ignore-strings t
+  "When non-nil, don't try to act safely in strings.
+Any unmatched delimiters inside of strings will be copied or deleted. This only
+applies when `lightlispy-safe-delete', `lightlispy-safe-copy', and/or `lightlispy-safe-paste'
+are non-nil."
+  :group 'lightlispy
+  :type 'boolean)
+
+(defcustom lightlispy-safe-actions-ignore-comments t
+  "When non-nil, don't try to act safely in comments.
+Any unmatched delimiters inside of comments will be copied or deleted. This only
+applies when `lightlispy-safe-delete', `lightlispy-safe-copy', and/or `lightlispy-safe-paste'
+are non-nil."
+  :group 'lightlispy
+  :type 'boolean)
+
+(defcustom lightlispy-safe-actions-no-pull-delimiters-into-comments nil
+  "When non-nil, don't pull unmatched delimiters into comments when deleting.
+This prevents the accidental unbalancing of expressions from commenting out
+delimiters. This only applies when `lightlispy-safe-delete', `lightlispy-safe-copy',
+and/or `lightlispy-safe-paste' are non-nil."
+  :group 'lightlispy
+  :type 'boolean)
+
 (defcustom lightlispy-no-space nil
   "When non-nil, don't insert a space before parens/brackets/braces/colons."
   :type 'boolean
@@ -147,6 +180,21 @@ These messages are similar to \"Beginning of buffer\" error for
   right of the source code (after lightlispy-right or at eol)."
   :type 'boolean
   :group 'lightlispy)
+
+(defcustom lightlispy-safe-delete nil
+  "When non-nil, killing/deleting an active region keeps delimiters balanced.
+This applies to `lightlispy-delete', `lightlispy-kill-at-point', `lightlispy-paste', and
+`lightlispy-delete-backward'. This also applies to `lightlispy-yank' when
+`delete-selection-mode' is non-nil."
+  :group 'lightlispy
+  :type 'boolean)
+
+(defcustom lightlispy-safe-threshold 1500
+  "The max size of an active region that lightlispy will try to keep balanced.
+This only applies when `lightlispy-safe-delete', `lightlispy-safe-copy', and/or
+`lightlispy-safe-paste' are non-nil."
+  :group 'lightlispy
+  :type 'number)
 
 (defsubst lightlispy-looking-back (regexp)
   "Forward to (`looking-back' REGEXP)."
@@ -268,6 +316,12 @@ Ignore the matches in strings and comments."
     (unless (lightlispy--in-string-or-comment-p)
       (replace-match to-string))))
 
+(defun lightlispy--delete-whitespace-backward ()
+  "Delete spaces backward."
+  (let ((pt (point)))
+    (skip-chars-backward " ")
+    (delete-region (point) pt)))
+
 (defun lightlispy-open-square (arg)
   "Forward to (`lightlispy-brackets' ARG).
 Insert \"[\" in strings and comments."
@@ -341,6 +395,17 @@ insert a space."
       (if (and (invisible-p (overlay-get ov 'invisible))
                (setq expose (overlay-get ov 'isearch-open-invisible)))
           (funcall expose ov)))))
+
+(defun lightlispy--delete-leading-garbage ()
+  "Delete any syntax before an opening delimiter such as '.
+Delete backwards to the closest whitespace char or opening delimiter or to the
+beginning of the line."
+  (let ((pt (point)))
+    (re-search-backward (concat "[[:space:]]" "\\|"
+                                lightlispy-left "\\|"
+                                "^"))
+    (goto-char (match-end 0))
+    (delete-region (point) pt)))
 
 (defun lightlispy-complain (msg)
   "Display MSG if `lightlispy-verbose' is t."
@@ -479,6 +544,35 @@ entry, prepend BEFORE and append AFTER to the regexp when they are specified."
                       regexps))
               "\\)"
               after))))
+
+(defun lightlispy--delete-pair-in-string (left right)
+  "Delete a pair of LEFT and RIGHT in string."
+  (let ((bnd (lightlispy--bounds-string)))
+    (when bnd
+      (let ((pos (cond ((looking-at left)
+                        (save-excursion
+                          (let ((b1 (match-beginning 0))
+                                (e1 (match-end 0))
+                                b2 e2)
+                            (when (re-search-forward right (cdr bnd) t)
+                              (setq b2 (match-beginning 0)
+                                    e2 (match-end 0))
+                              (delete-region b2 e2)
+                              (delete-region b1 e1)
+                              b1))))
+                       ((looking-at right)
+                        (save-excursion
+                          (let ((b1 (match-beginning 0))
+                                (e1 (match-end 0))
+                                b2 e2)
+                            (when (re-search-backward left (car bnd) t)
+                              (setq b2 (match-beginning 0)
+                                    e2 (match-end 0))
+                              (delete-region b1 e1)
+                              (delete-region b2 e2)
+                              (+ (point) (- b1 e2)))))))))
+        (when pos
+          (goto-char pos))))))
 
 (defun lightlispy-right (arg)
   "Move outside list forwards ARG times.
@@ -710,6 +804,33 @@ Return the amount of successful grow steps, nil instead of zero."
         (backward-list)
         (setq beg (point))
         (cons beg end)))))
+
+(defun lightlispy--maybe-safe-delete-region (beg end)
+  "Delete the region from BEG to END.
+If `lispy-safe-delete' is non-nil, exclude unmatched delimiters."
+  (if lightlispy-safe-delete
+      (let ((safe-regions (lightlispy--find-safe-regions beg end)))
+        (dolist (safe-region safe-regions)
+          (delete-region (car safe-region) (cdr safe-region))))
+    (delete-region beg end)))
+
+(defun lightlispy--find-safe-regions (beg end)
+  "Return a list of regions between BEG and END that are safe to delete.
+The regions are returned in reverse order so that they can be easily deleted
+without recalculation."
+  (let ((unmatched-delimiters (lightlispy--find-unmatched-delimiters beg end))
+        (maybe-safe-pos beg)
+        safe-regions)
+    (dolist (unsafe-pos unmatched-delimiters)
+      (unless (= maybe-safe-pos unsafe-pos)
+        (setq safe-regions
+              (nconc (lightlispy--maybe-split-safe-region maybe-safe-pos unsafe-pos
+                                                     t)
+                     safe-regions)))
+      (setq maybe-safe-pos (1+ unsafe-pos)))
+    (setq safe-regions
+          (nconc (lightlispy--maybe-split-safe-region maybe-safe-pos end)
+                 safe-regions))))
 
 (defun lightlispy-outline-right ()
   "Move right."
@@ -1035,6 +1156,44 @@ Return the amount of successful moves, or nil otherwise."
           (goto-char (match-beginning 0)))
       (- count to-move))))
 
+(defun lightlispy--maybe-split-safe-region (beg end &optional end-unsafe-p)
+  "Return a list of regions between BEG and END that are safe to delete.
+It is expected that there are no unmatched delimiters in between BEG and END.
+Split the region if deleting it would pull unmatched delimiters into a comment.
+Specifically, split the region if all of the following are true:
+
+- `lightlispy-safe-actions-no-pull-delimiters-into-comments' is non-nil
+- BEG is inside a comment
+- END is not in a comment
+- Either there are unmatched delimiters on the line after END or END-UNSAFE-P is
+  non-nil
+
+Otherwise, just return a list with the initial region. The regions are returned
+in reverse order so that they can be easily deleted without recalculation."
+  (if (and lightlispy-safe-actions-no-pull-delimiters-into-comments
+           ;; check that BEG is inside a comment
+           ;; `lightlispy--in-comment-p' returns t at comment start which is
+           ;; unwanted here
+           (and (save-excursion
+                  (nth 4 (syntax-ppss beg))))
+           (save-excursion
+             (goto-char end)
+             ;; check that END is not inside or a comment and that the
+             ;; following line has unmatched delimiters or has been specified
+             ;; as unsafe to pull into a comment
+             (and (not (lightlispy--in-comment-p))
+                  (or end-unsafe-p
+                      (lightlispy--find-unmatched-delimiters
+                       end
+                       (line-end-position))))))
+      ;; exclude newline; don't pull END into a comment
+      (let ((comment-end-pos (save-excursion
+                               (goto-char beg)
+                               (cdr (lightlispy--bounds-comment)))))
+        (list (cons (1+ comment-end-pos) end)
+              (cons beg comment-end-pos)))
+    (list (cons beg end))))
+
 (defun lightlispy-backward (arg)
   "Move backward list ARG times or until error.
 If couldn't move backward at least once, move up backward and return nil."
@@ -1270,6 +1429,65 @@ When this function is called:
                  (goto-char (cdr bnd))))
              (skip-chars-forward " \t")
              (kill-region beg (point)))))))
+
+(defun lightlispy--find-unmatched-delimiters (beg end)
+  "Return the positions of unmatched delimiters between BEG and END.
+When the region is a greater size than `lightlispy-safe-threshold', it will not be
+checked and nil will be returned."
+  (if (> (- end beg) lightlispy-safe-threshold)
+      nil
+    (save-excursion
+      (goto-char beg)
+      (let ((lightlispy-delimiters (concat (substring lightlispy-right 0 -1)
+                                      "\""
+                                      (substring lightlispy-left 1)))
+            matched-left-quote-p
+            string-bounds
+            string-end
+            comment-end
+            left-positions
+            right-positions)
+        (while (re-search-forward lightlispy-delimiters end t)
+          (let* ((match-beginning (match-beginning 0))
+                 (matched-delimiter (buffer-substring-no-properties
+                                     match-beginning
+                                     (match-end 0))))
+            (cond
+              ((and lightlispy-safe-actions-ignore-strings
+                    (save-excursion
+                      (goto-char match-beginning)
+                      (setq string-bounds (lightlispy--bounds-string))
+                      (setq string-end (cdr string-bounds))))
+               (setq matched-left-quote-p (= (1- (point))
+                                             (car string-bounds)))
+               (cond ((< (1- string-end) end)
+                      (goto-char string-end)
+                      ;; when skipping strings, will only match right quote
+                      ;; if left quote is not in the region
+                      (when (not matched-left-quote-p)
+                        (push (1- string-end) right-positions)))
+                     (t
+                      (when matched-left-quote-p
+                        ;; unmatched left quote
+                        (push match-beginning left-positions))
+                      (goto-char end))))
+              ((and lightlispy-safe-actions-ignore-comments
+                    (save-excursion
+                      (goto-char match-beginning)
+                      (setq comment-end (cdr (lightlispy--bounds-comment)))))
+               (if (< comment-end end)
+                   (goto-char comment-end)
+                 (goto-char end)))
+              (t
+               (unless (looking-back "\\\\." (- (point) 2))
+                 (if (or (string-match lightlispy-left matched-delimiter)
+                         (and (string= matched-delimiter "\"")
+                              (lightlispy--in-string-p)))
+                     (push match-beginning left-positions)
+                   (if (> (length left-positions) 0)
+                       (pop left-positions)
+                     (push match-beginning right-positions))))))))
+        (nreverse (append left-positions right-positions))))))
 
 (defalias 'lightlispy-brackets
   (lightlispy-pair "[" "]" 'lightlispy-brackets-preceding-syntax-alist)
@@ -1672,6 +1890,239 @@ the end of the line where that list ends."
          (lightlispy-backward 1)
          (lightlispy-forward 1)))
   (lightlispy--ensure-visible))
+
+(defun lightlispy-delete (arg)
+  "Delete ARG sexps."
+  (interactive "p")
+  (let (bnd)
+    (cond ((< arg 0)
+           (lightlispy-delete-backward (- arg)))
+
+          ((region-active-p)
+           (lightlispy--maybe-safe-delete-region (region-beginning) (region-end)))
+
+          ((setq bnd (lightlispy--bounds-string))
+           (cond ((eq (1+ (point)) (cdr bnd))
+                  (goto-char (car bnd))
+                  (when lightlispy-delete-sexp-from-within
+                    (lightlispy-delete arg)))
+                 ((looking-at "\\\\\"")
+                  (if (eq (+ (point) 2) (cdr bnd))
+                      (goto-char (car bnd))
+                    (delete-char 2)))
+                 ((and (looking-at "\"")
+                       (lightlispy-looking-back "\\\\"))
+                  (backward-char 1)
+                  (delete-char 2))
+                 ((lightlispy--delete-pair-in-string "\\\\\\\\(" "\\\\\\\\)"))
+                 ((looking-at "\\\\\\\\")
+                  (delete-char 2))
+                 ((and (looking-at "\\\\")
+                       (lightlispy-looking-back "\\\\"))
+                  (backward-char 1)
+                  (delete-char 2))
+                 ((eq (point) (car bnd))
+                  (delete-region (car bnd)
+                                 (cdr bnd))
+                  (let ((pt (point)))
+                    (skip-chars-forward " ")
+                    (delete-region pt (point))))
+                 ((save-excursion
+                    (forward-char 1)
+                    (lightlispy--in-string-or-comment-p))
+                  (delete-char arg))
+                 (t
+                  (lightlispy--exit-string))))
+
+          ((lightlispy--in-comment-p)
+           (if (lightlispy-bolp)
+               (let ((bnd (lightlispy--bounds-comment)))
+                 (delete-region (car bnd) (cdr bnd)))
+             (delete-char arg)))
+
+          ((looking-at lightlispy-right)
+           (lightlispy-left 1)
+           (when lightlispy-delete-sexp-from-within
+             (lightlispy-delete arg)))
+
+          ((lightlispy-left-p)
+           (lightlispy--delete-leading-garbage)
+           (lightlispy-dotimes arg
+             (lightlispy--delete)))
+
+          ((eolp)
+           (delete-char 1)
+           (let ((pt (point)))
+             (skip-chars-forward " ")
+             (delete-region pt (point))
+             (unless (or (eolp)
+                         (bolp)
+                         (lightlispy-bolp)
+                         (eq (char-before) ?\ ))
+               (insert " "))))
+
+          (t
+           (delete-char arg)))))
+
+(defun lightlispy-delete-backward (arg)
+  "From \")|\", delete ARG sexps backwards.
+Otherwise (`backward-delete-char-untabify' ARG)."
+  (interactive "p")
+  (let (bnd)
+    (cond ((< arg 0)
+           (lightlispy-delete (- arg)))
+
+          ((use-region-p)
+           (lightlispy--maybe-safe-delete-region (region-beginning)
+                                            (region-end)))
+          ((bobp))
+
+          ((and (setq bnd (lightlispy--bounds-string))
+                (not (eq (point) (car bnd))))
+           (cond ((eq (- (point) (car bnd)) 1)
+                  (goto-char (cdr bnd))
+                  (if lightlispy-delete-sexp-from-within
+                      (lightlispy-delete-backward arg)))
+                 ((or (looking-back "\\\\\\\\(" (car bnd))
+                      (looking-back "\\\\\\\\)" (car bnd)))
+                  (let ((pt (point)))
+                    (goto-char (match-beginning 0))
+                    (unless (lightlispy--delete-pair-in-string
+                             "\\\\\\\\(" "\\\\\\\\)")
+                      (goto-char pt)
+                      (backward-delete-char-untabify arg))))
+                 ((looking-back "[^\\]\\\\[^\\]" (car bnd))
+                  (backward-delete-char 2))
+                 (t
+                  (backward-delete-char-untabify arg))))
+
+          ((looking-at lightlispy-outline)
+           (if (lightlispy-looking-back (concat lightlispy-outline ".*\n"))
+               (delete-region
+                (match-beginning 0)
+                (match-end 0))
+             (delete-char -1)))
+
+          ((lightlispy--in-comment-p)
+           (cond ((lightlispy-looking-back "^ +")
+                  (delete-region (max (1- (match-beginning 0))
+                                      (point-min))
+                                 (match-end 0))
+                  (lightlispy--indent-for-tab))
+                 ((and (looking-at "$") (lightlispy-looking-back "; +"))
+                  (let ((pt (point)))
+                    (skip-chars-backward " ;")
+                    (delete-region (point) pt)
+                    (if (lightlispy-looking-back "^")
+                        (lightlispy--indent-for-tab)
+                      (let ((p (point)))
+                        (lightlispy--out-forward 1)
+                        (lightlispy--normalize-1)
+                        (goto-char p)))))
+                 (t
+                  (backward-delete-char-untabify arg))))
+
+          ((lightlispy-looking-back "\\\\.")
+           (backward-delete-char-untabify arg))
+
+          ((and (lightlispy-looking-back (concat lightlispy-right " "))
+                (looking-at " *$"))
+           (backward-delete-char-untabify arg))
+
+          ((or (and (lightlispy-right-p)
+                    (or (memq major-mode lightlispy-clojure-modes)
+                        (not (lightlispy-looking-back "[\\?]."))))
+               (and (lightlispy-looking-back (concat lightlispy-right " "))
+                    (or (lightlispy-left-p) (looking-at "\""))))
+           (let ((pt (point)))
+             (lightlispy-backward arg)
+             (unless (lightlispy-right-p)
+               (lightlispy--skip-delimiter-preceding-syntax-backward))
+             (skip-chars-backward " \t")
+             (while (plist-get (text-properties-at (point)) 'read-only)
+               (forward-char))
+             (delete-region (point) pt)
+             (unless (or (looking-at " ")
+                         (lightlispy-bolp)
+                         (and (lightlispy-right-p)
+                              (not (or (lightlispy-left-p)
+                                       (looking-at "\""))))
+                         (lightlispy-looking-back lightlispy-left)
+                         ;; REPL prompt, e.g. `ielm'
+                         (lightlispy-after-string-p "> "))
+               (just-one-space))
+             (setq pt (point))
+             (if (and
+                  (not (lightlispy-bolp))
+                  (not (lightlispy-left-p))
+                  (progn
+                    (skip-chars-backward " \t\n")
+                    (lightlispy-right-p)))
+                 (delete-region (point) pt)
+               (goto-char pt)
+               (lightlispy--indent-for-tab))))
+
+          ((and (lightlispy-looking-back lightlispy-left)
+                (not (lispy-looking-back "[\\?].")))
+           (lightlispy--out-forward 1)
+           (lightlispy-delete-backward 1))
+
+          ((eq (char-before) ?\")
+           (backward-char 1)
+           (let ((bnd (lightlispy--bounds-string)))
+             (delete-region (car bnd)
+                            (cdr bnd))
+             (lightlispy--delete-whitespace-backward)
+             (unless (looking-at " ")
+               (insert " "))
+             (lightlispy--indent-for-tab)))
+
+          ((and (lightlispy-after-string-p "\" ")
+                (not (looking-at lightlispy-right)))
+           (let ((pt (point)))
+             (backward-char 2)
+             (delete-region (car (lightlispy--bounds-string)) pt))
+           (lightlispy--delete-whitespace-backward)
+           (unless (lightlispy-looking-back lightlispy-left)
+             (just-one-space))
+           (lightlispy--indent-for-tab))
+
+          ((lightlispy-bolp)
+           (delete-region
+            (line-beginning-position)
+            (point))
+           (unless (bobp)
+             (if (and (not (eolp))
+                      (save-excursion
+                        (backward-char 1)
+                        (lightlispy--in-comment-p)))
+                 (progn
+                   (backward-char 1)
+                   (let ((bnd (lightlispy--bounds-comment)))
+                     (delete-region (car bnd) (cdr bnd)))
+                   (delete-char 1))
+               (backward-delete-char 1)
+               (unless (or (eolp)
+                           (looking-at lightlispy-right)
+                           (lightlispy-looking-back lightlispy-left))
+                 (just-one-space)))
+             (lightlispy--indent-for-tab)))
+
+          ((lightlispy-looking-back "[^ ]  +")
+           (delete-region (+ (match-beginning 0) 2) (point)))
+
+          (t
+           (backward-delete-char-untabify arg))))
+  (when (and (buffer-file-name)
+             (< (- (line-number-at-pos (point))
+                   (line-number-at-pos (window-start)))
+                5)
+             lightlispy-delete-backward-recenter)
+    (ignore-errors
+      (recenter lightlispy-delete-backward-recenter)))
+  (when (and (lightlispy-left-p)
+             (not (lightlispy--in-string-or-comment-p)))
+    (indent-sexp)))
 
 (defun lightlispy-comment (&optional arg)
   "Comment ARG sexps."
@@ -2326,8 +2777,9 @@ FUNC is obtained from (`lightlispy--insert-or-call' DEF PLIST)."
     (define-key map (kbd ";") 'lispy-comment)
     
     ;; from lispy-mode-map-lispy
-    (lightlispy-define-key map "[" 'lightlispy-forward)
-    (lightlispy-define-key map "]" 'lightlispy-backward) 
+    (define-key map "[" 'lightlispy-forward)
+    (define-key map "]" 'lightlispy-backward)
+    (define-key map (kbd "C-d") 'lightlispy-delete)
     
     map))
 
