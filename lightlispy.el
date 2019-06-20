@@ -38,6 +38,8 @@
 
 
 ;;; code
+(defvar geiser-active-implementations)
+(defvar clojure-align-forms-automatically)
 (defvar lightlispy-right "[])}]"
   "Closing delimiter.")
 
@@ -59,10 +61,90 @@
 (defvar lightlispy-pos-ring (make-ring 100)
   "Ring for point and mark position history.")
 
+(defvar lightlispy-parens-only-left-in-string-or-comment t
+  "Whether \"(\" should insert only the left paren in strings and comments.")
+
+(defvar lightlispy-brackets-preceding-syntax-alist
+  '((clojure-mode . ("[`']" "#[A-z.]*"))
+    (clojurescript-mode . ("[`']" "#[A-z.]*"))
+    (clojurec-mode . ("[`']" "#[A-z.]*"))
+    (cider-repl-mode . ("[`']" "#[A-z.]*"))
+    (cider-clojure-interaction-mode . ("[`']" "#[A-z.]*"))
+    (scheme-mode . ("[#`',@]+" "#hash"))
+    (t . nil))
+  "An alist of `major-mode' to a list of regexps.
+Each regexp describes valid syntax that can precede an opening bracket in that
+major mode. These regexps are used to determine whether to insert a space for
+`lightlispy-brackets'.")
+
+(defvar lightlispy-parens-preceding-syntax-alist
+  '((lisp-mode . ("[#`',.@]+" "#[0-9]*" "#[.,Ss+-]" "#[0-9]+[=Aa]"))
+    (emacs-lisp-mode . ("[#`',@]+" "#s" "#[0-9]+="))
+    (clojure-mode . ("[`'~@]+" "#" "#\\?@?"))
+    (clojurescript-mode . ("[`'~@]+" "#" "#\\?@?"))
+    (clojurec-mode . ("[`'~@]+" "#" "#\\?@?"))
+    (cider-repl-mode . ("[`'~@]+" "#" "#\\?@?"))
+    (cider-clojure-interaction-mode . ("[`'~@]+" "#" "#\\?@?"))
+    (scheme-mode . ("[#`',@]+" "#hash"))
+    (t . ("[`',@]+")))
+  "An alist of `major-mode' to a list of regexps.
+Each regexp describes valid syntax that can precede an opening paren in that
+major mode. These regexps are used to determine whether to insert a space for
+`lightlispy-parens'.")
+
+(defvar lightlispy-no-indent-modes '(minibuffer-inactive-mode
+                                     comint-mode)
+  "List of major modes where `indent-for-tab-command' should not be used.
+`lightlispy--indent-for-tab' will do nothing if the current mode or any of its parent
+modes is in this list.")
+
+(defvar lightlispy-clojure-modes
+  '(clojure-mode clojurescript-mode clojurex-mode clojurec-mode)
+  "Modes for which clojure related functions are appropriate.")
+
+(defvar lightlispy-do-fill nil
+  "If t, `lightlispy-insert-1' will try to fill.")
+
+(defvar lightlispy--braces-table
+  (let ((table (make-char-table 'syntax-table nil)))
+    (modify-syntax-entry ?\{ "(}  " table)
+    (modify-syntax-entry ?\} "){  " table)
+    (modify-syntax-entry ?\[ "(]  " table)
+    (modify-syntax-entry ?\] ")[  " table)
+    (modify-syntax-entry ?\( "()  " table)
+    (modify-syntax-entry ?\) ")(  " table)
+    table)
+  "Syntax table for paired braces.")
+
+(defcustom lightlispy-no-space nil
+  "When non-nil, don't insert a space before parens/brackets/braces/colons."
+  :type 'boolean
+  :group 'lightlispy)
+(make-variable-buffer-local 'lightlispy-no-space)
+
+(defcustom lightlispy-insert-space-after-wrap t
+  "When non-nil, insert a space after the point when wrapping.
+This applies to the commands that use `lightlispy-pair'."
+  :group 'lightlispy
+  :type 'boolean)
+
 (defcustom lightlispy-verbose t
   "If t, lightlispy will display some messages on error state.
 These messages are similar to \"Beginning of buffer\" error for
 `backward-char' and can safely be ignored."
+  :type 'boolean
+  :group 'lightlispy)
+
+(defcustom lightlispy-move-after-commenting t
+  "When non-nil, adjust point to next sexp after commenting out a
+  sexp. If at last sexp in list, move out and backwards to
+  enclosing sexp."
+  :type 'boolean
+  :group 'lightlispy)
+
+(defcustom lightlispy-comment-use-single-semicolon nil
+  "When non-nil, prefer single semicolons for comments at the
+  right of the source code (after lightlispy-right or at eol)."
   :type 'boolean
   :group 'lightlispy)
 
@@ -81,6 +163,14 @@ These messages are similar to \"Beginning of buffer\" error for
 
 ;; Should we keep this?
 (declare-function lightlispy-bounds-python-block "le-python")
+
+(defun lightlispy--splice-to-str (sexp)
+  "Return the printed representation of SEXP.
+The outer delimiters are stripped."
+  (if sexp
+      (substring
+       (prin1-to-string sexp) 1 -1)
+    ""))
 
 (defmacro lightlispy-dotimes (n &rest bodyform)
   "Execute N times the BODYFORM unless an error is signaled.
@@ -122,6 +212,18 @@ Otherwise return the amount of times executed."
          (unless (eq ,at-start (lightlispy--leftp))
            (lightlispy-different))))))
 
+(defmacro lightlispy-flet (binding &rest body)
+  "Temporarily override BINDING and execute BODY."
+  (declare (indent 1))
+  (let* ((name (car binding))
+         (old (cl-gensym (symbol-name name))))
+    `(let ((,old (symbol-function ',name)))
+       (unwind-protect
+            (progn
+              (fset ',name (lambda ,@(cdr binding)))
+              ,@body)
+         (fset ',name ,old)))))
+
 (defun lightlispy-bolp ()
   "Return t if point is at beginning of line, after optional spaces."
   (save-excursion
@@ -151,6 +253,36 @@ Otherwise return the amount of times executed."
       (forward-char 1))
     (nth 4 (syntax-ppss))))
 
+(defun lightlispy--skip-elisp-char ()
+  (unless (lightlispy-after-string-p "?")
+    (error "unexpected"))
+  (if (looking-at "\\\\")
+      (forward-sexp 1)
+    (forward-char 1)))
+
+(defun lightlispy--replace-regexp-in-code (regexp to-string)
+  "Replace text matching REGEXP with TO-STRING in whole buffer.
+Ignore the matches in strings and comments."
+  (goto-char (point-min))
+  (while (re-search-forward regexp nil t)
+    (unless (lightlispy--in-string-or-comment-p)
+      (replace-match to-string))))
+
+(defun lightlispy-open-square (arg)
+  "Forward to (`lightlispy-brackets' ARG).
+Insert \"[\" in strings and comments."
+  (interactive "P")
+  (if (lightlispy--in-string-or-comment-p)
+      (insert "[")
+    (lightlispy-brackets arg)))
+
+(defun lightlispy--raw-comment-p (expr)
+  "Return t if EXPR is a raw comment."
+  (and (listp expr)
+       (eq (car expr) 'ly-raw)
+       (consp (cdr expr))
+       (eq (cadr expr) 'comment)))
+
 (defun lightlispy--in-string-or-comment-p ()
   "Test if point is inside a string or a comment."
   (let* ((sp (syntax-ppss))
@@ -175,6 +307,25 @@ Otherwise return the amount of times executed."
      (point-min))
     (point))
    str))
+
+(defun lightlispy--in-string-p ()
+  "Test if point is inside a string.
+Return start of string it is."
+  (let ((syn (syntax-ppss)))
+    (or (and (nth 3 syn)
+             (nth 8 syn))
+        (and (eq (char-after) ?\")
+             (not (eq ?\\ (char-before)))
+             (point)))))
+
+(defun lightlispy--delimiter-space-unless (preceding-syntax-alist)
+  "Like `lightlispy--space-unless' but use PRECEDING-SYNTAX-ALIST for decision.
+PRECEDING-SYNTAX-ALIST should be an alist of `major-mode' to a list of regexps.
+When `looking-back' at any of these regexps, whitespace, or a delimiter, do not
+insert a space."
+  (lightlispy--space-unless
+   (concat "^\\|\\s-\\|" lightlispy-left
+           (lightlispy--preceding-syntax preceding-syntax-alist "\\|"))))
 
 (defun lightlispy--string-dwim (&optional bounds)
   "Return the string that corresponds to BOUNDS.
@@ -201,6 +352,83 @@ Otherwise return the amount of times executed."
               'face 'font-lock-keyword-face)
              msg)
     nil))
+
+(defun lightlispy--sexp-trim-trailing-newlines (foo comment)
+  "Trim trailing (ly-raw newline) from FOO.
+Treat comments differently when COMMENT is t."
+  (if (and (consp foo) (consp (cdr foo)))
+      (let ((expr (reverse foo)))
+        (while (and (consp expr)
+                    (listp expr)
+                    (equal (car expr) '(ly-raw newline))
+                    (not (and comment
+                              (lightlispy--raw-comment-p (cadr expr)))))
+          (setq expr (cdr expr)))
+        (reverse expr))
+    foo))
+
+(defun lightlispy--prin1-to-string (expr offset mode)
+  "Return the string representation of EXPR.
+EXPR is indented first, with OFFSET being the column position of
+the first character of EXPR.
+MODE is the major mode for indenting EXPR."
+  (let ((lif lisp-indent-function))
+    (with-temp-buffer
+      (funcall mode)
+      (dotimes (_i offset)
+        (insert ?\ ))
+      (let ((lisp-indent-function lif))
+        (lightlispy--insert expr))
+      (buffer-substring-no-properties
+       (+ (point-min) offset)
+       (point-max)))))
+
+(defun lightlispy--sexp-normalize (foo)
+  "Return a pretty version of FOO.
+Only `ly-raw' lists within FOO are manipulated."
+  (cond ((null foo)
+         nil)
+
+        ((consp foo)
+         (cons (lightlispy--sexp-normalize
+                (lightlispy--sexp-trim-trailing-newlines (car foo) t))
+               (lightlispy--sexp-normalize
+                (lispy--sexp-trim-trailing-newlines (cdr foo) t))))
+        (t
+         foo)))
+
+(defun lispy--out-backward (arg)
+  "Move outside list forwards ARG times.
+Return nil on failure, t otherwise."
+  (let ((oldpt (point))
+        newpt)
+    (lightlispy--out-forward arg)
+    (when (lightlispy-right-p)
+      (forward-list -1))
+    (if (= oldpt (setq newpt (point)))
+        nil
+      newpt)))
+
+(defun lightlispy--space-unless (context)
+  "Insert one space.
+Unless inside string or comment, or `looking-back' at CONTEXT."
+  (let ((inhibit-field-text-motion t))
+    (unless (or lightlispy-no-space
+                (bolp)
+                (and (window-minibuffer-p)
+                     (eq (point) (minibuffer-prompt-end)))
+                (lightlispy--in-string-or-comment-p)
+                (lightlispy-looking-back context))
+      (insert " "))))
+
+(defun lightlispy--indent-for-tab ()
+  "Call `indent-for-tab-command'."
+  (unless (or (memq major-mode lightlispy-no-indent-modes)
+              (apply #'derived-mode-p lightlispy-no-indent-modes)
+              (= 0 (buffer-size)))
+    (let ((tab-always-indent t))
+      (lightlispy-flet (message (&rest _x))
+                       (indent-for-tab-command)))))
 
 (defun lightlispy--indent-region (beg end)
   "Indent region BEG END without reporting progress."
@@ -235,6 +463,23 @@ or to the beginning of the line."
         (t
          (user-error "Unexpected"))))
 
+(defun lightlispy--preceding-syntax (preceding-syntax-alist &optional before after)
+  "Return a regexp corresponding to valid syntax that can precede delimiters.
+This is done by checking PRECEDING-SYNTAX-ALIST for the current major mode.
+Return nil if there is no entry for the current major mode. When there is an
+entry, prepend BEFORE and append AFTER to the regexp when they are specified."
+  (let ((regexps (or (cdr (assoc major-mode preceding-syntax-alist))
+                     (cdr (assoc t preceding-syntax-alist)))))
+    (when regexps
+      (concat before
+              "\\(?:"
+              (apply #'concat
+                     (lightlispy-interleave
+                      "\\|"
+                      regexps))
+              "\\)"
+              after))))
+
 (defun lightlispy-right (arg)
   "Move outside list forwards ARG times.
 Return nil on failure, t otherwise."
@@ -248,6 +493,17 @@ Return nil on failure, t otherwise."
          (lightlispy-outline-right))
         (t
          (lightlispy--out-forward arg))))
+
+(defun lightlispy--surround-region (alpha omega)
+  "Surround active region with ALPHA and OMEGA and re-indent."
+  (let ((beg (region-beginning))
+        (end (region-end)))
+    (goto-char end)
+    (insert omega)
+    (goto-char beg)
+    (insert alpha)
+    (deactivate-mark)
+    (indent-region beg (+ 2 end))))
 
 (defun lightlispy-left (arg)
   "Move outside list forwards ARG times.
@@ -293,6 +549,7 @@ Return nil on failure, (point) otherwise."
           (forward-list))
         (throw 'break nil)))
     (point)))
+
 
 (defun lightlispy--remove-gaps ()
   "Remove dangling `\\s)'."
@@ -370,6 +627,16 @@ Return the amount of successful grow steps, nil instead of zero."
     (insert char)
     (backward-char)))
 
+(defun lightlispy--in-empty-list-p (preceding-syntax-alist)
+  "Test whether the point is in a list with no sexps.
+A list with only characters that can precede a delimiter (e.g. \"`(,)\") is
+consider an empty list."
+  (and (lightlispy-looking-back
+        (concat lightlispy-left
+                "[[:space:]]*"
+                (lightlispy--preceding-syntax preceding-syntax-alist nil "*")))
+       (looking-at (concat "[[:space:]]*" lightlispy-right))))
+
 (defun lightlispy--sub-slurp-backward (arg)
   "Grow current marked symbol by ARG backwards.
 Return the amount of successful grow steps, nil instead of zero."
@@ -428,6 +695,22 @@ Return the amount of successful grow steps, nil instead of zero."
       (insert char)
       (lightlispy--indent-region (point) pt))))
 
+(defun lightlispy--bounds-list ()
+  "Return the bounds of smallest list that includes the point."
+  (save-excursion
+    (lightlispy--exit-string)
+    (when (looking-at lispy-left)
+      (forward-char))
+    (when (lightlispy-looking-back lightlispy-right)
+      (backward-char))
+    (ignore-errors
+      (let (beg end)
+        (up-list)
+        (setq end (point))
+        (backward-list)
+        (setq beg (point))
+        (cons beg end)))))
+
 (defun lightlispy-outline-right ()
   "Move right."
   (interactive)
@@ -443,6 +726,26 @@ Return the amount of successful grow steps, nil instead of zero."
         (goto-char pt)))
     (lightlispy--ensure-visible)
     result))
+
+(defun lightlispy-kill-word (arg)
+  "Kill ARG words, keeping parens consistent."
+  (interactive "p")
+  (if (< arg 0)
+      (lightlispy-backward-kill-word (- arg))
+    (let (bnd)
+      (lightlispy-dotimes arg
+        (while (not (or (eobp)
+                        (memq (char-syntax (char-after))
+                              '(?w ?_))))
+          (forward-char 1))
+        (unless (lightlispy-bolp)
+          (delete-horizontal-space))
+        (if (setq bnd (lightlispy--bounds-string))
+            (save-restriction
+              (narrow-to-region (1+ (car bnd)) (1- (cdr bnd)))
+              (kill-word 1)
+              (widen))
+          (kill-word 1))))))
 
 (defun lightlispy-mark-left (arg)
   "Go left ARG times and mark."
@@ -474,6 +777,32 @@ Return the amount of successful grow steps, nil instead of zero."
       (lightlispy--mark
        (lightlispy--bounds-dwim))
       r)))
+
+(defun lightlispy--not-at-sexp-p (preceding-syntax-alist)
+  "Test whether the point is at a \"free\" spot and not at a wrappable sexp.
+PRECEDING-SYNTAX-ALIST should be an alist of `major-mode' to a list of regexps.
+The regexps correspond to valid syntax that can precede an opening delimiter in
+each major mode."
+  (let* ((space "[[:space:]]")
+         (space-or-eol (concat "\\(" space "+\\|" space "*$\\)"))
+         (right-or-eol (concat "\\(" lightlispy-right "+\\|" space "*$\\)"))
+         (special-syntax (lightlispy--preceding-syntax preceding-syntax-alist))
+         (line (buffer-substring-no-properties
+                (line-beginning-position)
+                (line-end-position))))
+    (or (lightlispy--in-empty-list-p preceding-syntax-alist)
+        ;; empty line
+        (string-match (concat "^" space "*" special-syntax "*" space "*$")
+                      line)
+        ;; empty position at end of list or line
+        (and (looking-at right-or-eol)
+             (lightlispy-looking-back (concat space "+" special-syntax "*")))
+        ;; empty position at beginning of list
+        (and (looking-at space-or-eol)
+             (lightlispy-looking-back (concat lightlispy-left special-syntax "*")))
+        ;; empty position in middle
+        (and (looking-at (concat space "+"))
+             (lightlispy-looking-back (concat space "+" special-syntax "*"))))))
 
 (defun lightlispy--reindent (&optional arg)
   "Reindent current sexp.  Up-list ARG times before that."
@@ -536,6 +865,94 @@ Return the amount of successful grow steps, nil instead of zero."
                (goto-char pt)
                (end-of-line)
                (cons beg (point))))))))
+
+(defun lightlispy--normalize-1 ()
+  "Normalize/prettify current sexp."
+  (when (and (looking-at "(")
+             (= (point)
+                (save-excursion
+                  (lightlispy--out-backward 99)
+                  (point))))
+    (let ((pt (point)))
+      (skip-chars-backward " \t")
+      (delete-region pt (point))))
+  (let* ((bnd (lightlispy--bounds-dwim))
+         (str (lightlispy--string-dwim bnd))
+         (offset (save-excursion
+                   (goto-char (car bnd))
+                   (current-column)))
+         (was-left (lightlispy-left-p)))
+    (cond ((or (and (memq major-mode lightlispy-clojure-modes)
+                    (or (string-match "\\^" str)
+                        (string-match "~" str)))
+               (> (length str) 10000))
+           (lightlispy-from-left
+            (indent-sexp)))
+          ((looking-at ";;"))
+          (t
+           (let* ((max-lisp-eval-depth 10000)
+                  (max-specpdl-size 10000)
+                  (geiser-active-implementations
+                   (and (bound-and-true-p geiser-active-implementations)
+                        (list (car geiser-active-implementations))))
+                  (res (lightlispy--sexp-normalize
+                        (lightlispy--read str)))
+                  (new-str (lightlispy--prin1-to-string res offset major-mode)))
+             (unless (string= str new-str)
+               (delete-region (car bnd)
+                              (cdr bnd))
+               (insert new-str)
+               (when was-left
+                 (backward-list))))))
+    (when (and (memq major-mode lightlispy-clojure-modes)
+               clojure-align-forms-automatically)
+      (clojure-align (car bnd) (cdr bnd)))))
+
+(defun lightlispy-backward-kill-word (arg)
+  "Kill ARG words backward, keeping parens consistent."
+  (interactive "p")
+  (let (bnd
+        (pt (point))
+        (last-command (if (eq last-command 'lightlispy-backward-kill-word)
+                          'kill-region
+                        last-command)))
+    (lightlispy-dotimes arg
+      (when (lightlispy--in-comment-p)
+        (skip-chars-backward " \n"))
+      (if (memq (char-syntax (char-before))
+                '(?w ?_ 32))
+          (if (lightlispy-looking-back "\\_<\\s_+")
+              (delete-region (match-beginning 0)
+                             (match-end 0))
+            (backward-kill-word 1)
+            (when (and (lightlispy--in-string-p)
+                       (not (lightlispy-looking-back "\\\\\\\\"))
+                       (lightlispy-looking-back "\\\\"))
+              (delete-char -1)))
+        (delete-region (point) pt)
+        (while (not (or (bobp)
+                        (memq (char-syntax (char-before))
+                              '(?w ?_))))
+          (backward-char 1))
+        (if (setq bnd (lightlispy--bounds-string))
+            (progn
+              (save-restriction
+                (if (and (looking-at "\\s-+\"")
+                         (eq (match-end 0) (cdr bnd)))
+                    (goto-char (1- (cdr bnd)))
+                  (when (and (> pt (car bnd))
+                             (< pt (cdr bnd)))
+                    (goto-char pt)))
+                (narrow-to-region (1+ (car bnd)) (point))
+                (kill-region (progn
+                               (forward-word -1)
+                               (when (and (not (lightlispy-looking-back "\\\\\\\\"))
+                                          (lightlispy-looking-back "\\\\"))
+                                 (backward-char))
+                               (point))
+                             (point-max))
+                (widen)))
+          (backward-kill-word 1))))))
 
 (defun lightlispy-forward (arg)
   "Move forward list ARG times or until error.
@@ -710,6 +1127,153 @@ The outcome when ahead of sexps is different from when behind."
            (error "Unexpected")))
     (lightlispy-raise 1)
     (deactivate-mark)))
+
+(defun lightlispy-pair (left right preceding-syntax-alist)
+  "Return (lambda (arg)(interactive \"P\")...) using LEFT RIGHT.
+PRECEDING-SYNTAX-ALIST should be an alist of `major-mode' to a list of regexps.
+The regexps correspond to valid syntax that can precede LEFT in each major mode.
+When this function is called:
+- with region active:
+  Wrap region with LEFT RIGHT.
+- with region active and arg 1:
+  Wrap region with LEFT RIGHT and put the point after LEFT followed by a space.
+- with arg nil:
+  Insert LEFT RIGHT.
+- with arg negative:
+  Wrap as many sexps as possible until the end of the line with LEFT RIGHT.
+- with arg 0:
+  Wrap as many sexps as possible with LEFT RIGHT.
+- with the universal arg:
+  Wrap one sexp with LEFT RIGHT.
+- with arg positive:
+  Wrap that number of sexps with LEFT RIGHT or as many as possible."
+  `(lambda (arg)
+     (interactive "P")
+     (cond ((not arg))
+           ((listp arg)
+            (setq arg 1))
+           (t
+            (setq arg (prefix-numeric-value arg))))
+     (cond ((region-active-p)
+            (lightlispy--surround-region ,left ,right)
+            (when (and (lightlispy-looking-back lightlispy-left)
+                       (or (lightlispy-left-p)
+                           (> (or arg 0) 0)))
+              (insert " "))
+            (backward-char 1))
+           ((and (lightlispy--in-string-p)
+                 (lightlispy-looking-back "\\\\\\\\"))
+            (insert ,left "\\\\" ,right)
+            (backward-char 3))
+           ((lightlispy--in-string-or-comment-p)
+            (if (and lightlispy-parens-only-left-in-string-or-comment
+                     (string= ,left "(")
+                     (= ?\( (aref (this-command-keys-vector) 0)))
+                (insert "(")
+              (insert ,left ,right)
+              (backward-char 1)))
+           ((lightlispy-after-string-p "?\\")
+            (insert ,left))
+           ((not arg)
+            (lightlispy--indent-for-tab)
+            (lightlispy--delimiter-space-unless ,preceding-syntax-alist)
+            (insert ,left ,right)
+            (unless (or (eolp)
+                        (lightlispy--in-string-p)
+                        (looking-at "\n\\|)\\|}\\|\\]"))
+              (just-one-space)
+              (backward-char 1))
+            (when (looking-at ,(regexp-quote left))
+              (insert " ")
+              (backward-char))
+            (backward-char))
+           (t
+            ;; don't jump backwards or out of a list when not at a sexp
+            (unless (lightlispy--not-at-sexp-p ,preceding-syntax-alist)
+              (when (lightlispy--bounds-dwim)
+                (goto-char (car (lightlispy--bounds-dwim)))))
+            (lightlispy--indent-for-tab)
+            (insert ,left ,right)
+            (save-excursion
+              (lightlispy-slurp arg))
+            (when (or (looking-at lightlispy-right)
+                      (and (eolp)
+                           (looking-back lightlispy-right (1- (point)))))
+              ;; failed to wrap anything
+              (backward-char))
+            (when (and lightlispy-insert-space-after-wrap
+                       (not (lightlispy--in-empty-list-p ,preceding-syntax-alist))
+                       (not (eolp)))
+              (just-one-space)
+              (backward-char))))))
+
+(defalias 'lightlispy-parens
+  (lightlispy-pair "(" ")" 'lightlispy-parens-preceding-syntax-alist)
+  "`lightlispy-pair' with ().")
+
+(defun lightlispy-kill ()
+  "Kill line, keeping parens consistent."
+  (interactive)
+  (let (bnd)
+    (cond ((or (lightlispy--in-comment-p)
+               (and (looking-at " *;")
+                    (save-excursion
+                      (goto-char (match-end 0))
+                      (lightlispy--in-comment-p))))
+           (kill-line))
+
+          ((and (setq bnd (lightlispy--bounds-string))
+                (or
+                 (not (eq (point) (car bnd)))
+                 (> (count-lines (car bnd) (cdr bnd)) 1)))
+           (if (> (cdr bnd) (line-end-position))
+               (if (eq (point) (car bnd))
+                   (kill-region (car bnd) (cdr bnd))
+                 (kill-line))
+             (kill-region (point) (1- (cdr bnd)))))
+          ((looking-at " *\n")
+           (kill-region
+            (match-beginning 0)
+            (match-end 0))
+           (lightlispy--indent-for-tab))
+          ((and (looking-at lightlispy-right) (looking-back lightlispy-left
+                                                            (line-beginning-position)))
+           (delete-char 1)
+           (backward-delete-char 1))
+          ((lightlispy-left-p)
+           (if (progn
+                 (setq bnd (lightlispy--bounds-list))
+                 (> (count-lines (car bnd) (cdr bnd)) 1))
+               (kill-region (car bnd)
+                            (cdr bnd))
+             (narrow-to-region (car bnd) (line-end-position))
+             (let ((pt (point)))
+               (while (and (ignore-errors
+                             (forward-list))
+                           (> (point) pt))
+                 (setq pt (point)))
+               (when (looking-at "[\t ]*;[^\n]*$")
+                 (setq pt (match-end 0)))
+               (goto-char (point-min))
+               (widen)
+               (kill-region (point) pt))))
+          (t
+           (let ((beg (point))
+                 (end (line-end-position))
+                 bnd)
+             (while (and (< (point) end)
+                         (ignore-errors
+                           (forward-sexp 1)
+                           (skip-chars-forward " ")
+                           t))
+               (when (setq bnd (lightlispy--bounds-comment))
+                 (goto-char (cdr bnd))))
+             (skip-chars-forward " \t")
+             (kill-region beg (point)))))))
+
+(defalias 'lightlispy-brackets
+  (lightlispy-pair "[" "]" 'lightlispy-brackets-preceding-syntax-alist)
+  "`lightlispy-pair' with [].")
 
 (defun lightlispy--insert-or-call (def plist)
   "Return a lambda to call DEF if position is special.
@@ -1109,6 +1673,122 @@ the end of the line where that list ends."
          (lightlispy-forward 1)))
   (lightlispy--ensure-visible))
 
+(defun lightlispy-comment (&optional arg)
+  "Comment ARG sexps."
+  (interactive "p")
+  (setq arg (or arg 1))
+  (if (and (> arg 1) (lightlispy--in-comment-p))
+      (let ((bnd (lightlispy--bounds-comment)))
+        (uncomment-region (car bnd) (cdr bnd)))
+    (lightlispy-dotimes arg
+      (let (bnd)
+        (cond ((region-active-p)
+               (comment-dwim nil)
+               (when (lightlispy--in-string-or-comment-p)
+                 (lightlispy--out-backward 1)))
+              ((lightlispy--in-string-or-comment-p)
+               (cond ((and (eq major-mode 'emacs-lisp-mode)
+                           (lightlispy-after-string-p ";;; "))
+                      (delete-char -1)
+                      (insert "###autoload")
+                      (forward-char 1))
+                     ((lightlispy-after-string-p ";; ")
+                      (backward-char 1)
+                      (insert ";")
+                      (forward-char 1))
+                     ((and lightlispy-comment-use-single-semicolon
+                           (lightlispy-after-string-p "; "))
+                      (delete-region
+                       (point)
+                       (progn
+                         (skip-chars-backward "; \n")
+                         (point)))
+                      (insert " ;; "))
+                     (t
+                      (self-insert-command 1))))
+              ((memq (char-before) '(?\\ ?\#))
+               (self-insert-command 1))
+              ((lightlispy-left-p)
+               (setq bnd (lightlispy--bounds-dwim))
+               (when lightlispy-move-after-commenting
+                 (lightlispy-down 1))
+               (comment-region (car bnd) (cdr bnd))
+               (when lightlispy-move-after-commenting
+                 (when (or (lightlispy--in-string-or-comment-p)
+                           (looking-at ";"))
+                   (lightlispy--out-backward 1))))
+              ((lightlispy-right-p)
+               (if lightlispy-comment-use-single-semicolon
+                   (progn
+                     (unless (eolp)
+                       (newline-and-indent)
+                       (skip-chars-backward "\n\t "))
+                     (comment-dwim nil)
+                     (just-one-space))
+                 (progn
+                   (newline-and-indent)
+                   (insert ";; ")
+                   (unless (eolp)
+                     (newline)
+                     (lightlispy--reindent 1)
+                     (skip-chars-backward "\n\t ")
+                     (forward-char 1)))))
+              ((eolp)
+               (comment-dwim nil)
+               (when lightlispy-comment-use-single-semicolon
+                 (just-one-space)))
+              ((looking-at " *[])}]")
+               (if lightlispy-comment-use-single-semicolon
+                   (if (lightlispy-bolp)
+                       (insert ";;\n")
+                     (insert ";\n"))
+                 (progn
+                   (unless (lightlispy-bolp)
+                     (insert "\n"))
+                   (insert ";;\n")))
+               (when (lightlispy--out-forward 1)
+                 (lightlispy--normalize-1))
+               (move-end-of-line 0)
+               (insert " "))
+              ((lightlispy-bolp)
+               (let ((bnd (lightlispy--bounds-list)))
+                 (cond ((null bnd)
+                        (comment-region (point) (line-end-position)))
+                       ((<= (cdr bnd) (line-end-position))
+                        (comment-region (point)
+                                        (1- (cdr bnd))))
+                       (t
+                        (let ((beg (point))
+                              (ln-start (line-number-at-pos)))
+                          (forward-sexp)
+                          (while (and (= (line-number-at-pos) ln-start)
+                                      (not (eolp)))
+                            (forward-sexp))
+                          (comment-region beg (point))
+                          (goto-char beg))))
+                 (skip-chars-forward " ")))
+              ((setq bnd (save-excursion
+                           (and (lightlispy--out-forward 1)
+                                (point))))
+               (let ((pt (point)))
+                 (if (re-search-forward "\n" bnd t)
+                     (if (= (count-matches lightlispy-left pt (point))
+                            (count-matches lightlispy-right pt (point)))
+                         (progn (comment-region pt (point))
+                                (lightlispy-forward 1)
+                                (lightlispy-backward 1))
+                       (goto-char pt)
+                       (re-search-forward lightlispy-left bnd t)
+                       (backward-char 1)
+                       (forward-list 1)
+                       (comment-region pt (point))
+                       (lightlispy-forward 1)
+                       (lightlispy-backward 1))
+                   (comment-region (point) (1- bnd))
+                   (lightlispy--out-backward 1))))
+              (t
+               (self-insert-command 1)))))))
+
 (defun lightlispy--bounds-dwim ()
   "Return a cons of region bounds if it's active.
 Otherwise return cons of current string, symbol or list bounds."
@@ -1178,6 +1858,440 @@ Otherwise return cons of current string, symbol or list bounds."
                     (forward-word 1)
                     (bounds-of-thing-at-point 'symbol))))))))))
 
+(defun lightlispy--read (str)
+  "Read STR including comments and newlines."
+  (let* ((deactivate-mark nil)
+         (mode major-mode)
+         cbnd
+         (str (with-temp-buffer
+                (funcall mode)
+                (insert str)
+                ;; ——— ly-raw —————————————————
+                (lightlispy--replace-regexp-in-code "(ly-raw" "(ly-raw raw")
+                ;; ——— comments ———————————————
+                (goto-char (point-min))
+                (while (comment-search-forward (point-max) t)
+                  (lightlispy--beginning-of-comment)
+                  (setq cbnd (cons (point) (line-end-position)))
+                  (setq str (lightlispy--string-dwim cbnd))
+                  (delete-region (car cbnd) (cdr cbnd))
+                  (insert (format "(ly-raw comment %S)" str)))
+                ;; ——— reader macro syntax (LISP)
+                (goto-char (point-min))
+                (while (re-search-forward "#[a-z][\"(]" nil t)
+                  (forward-char -1)
+                  (unless (lightlispy--in-string-or-comment-p)
+                    (let ((beg (match-beginning 0))
+                          rep)
+                      (forward-sexp 1)
+                      (setq rep (format "(ly-raw lisp-macro %S)"
+                                        (buffer-substring-no-properties
+                                         beg (point))))
+                      (delete-region beg (point))
+                      (insert rep))))
+                ;; ——— strings ————————————————
+                (goto-char (point-min))
+                (while (re-search-forward "\"" nil t)
+                  (progn
+                    (setq cbnd (lightlispy--bounds-string))
+                    (when cbnd
+                      (if (or (lightlispy-after-string-p "ly-raw comment \"")
+                              (lightlispy-after-string-p "ly-raw lisp-macro \""))
+                          (goto-char (cdr cbnd))
+                        (setq str (lightlispy--string-dwim cbnd))
+                        (delete-region (car cbnd) (cdr cbnd))
+                        (insert (format "(ly-raw string %S)" str))))))
+                ;; ——— newlines ———————————————
+                (lightlispy--replace-regexp-in-code "\n" " (ly-raw newline)")
+                ;; ——— numbers ————————————————
+                (goto-char (point-min))
+                (while (re-search-forward "\\b[+-]?[0-9]+\\(?:\\.[0-9]+\\)?\\(?:e[+-]?[0-9]*\\)" nil t)
+                  (if (setq cbnd (lightlispy--bounds-string))
+                      (goto-char (cdr cbnd))
+                    (let ((s (match-string-no-properties 0)))
+                      (delete-region (match-beginning 0) (match-end 0))
+                      (insert (format "(ly-raw float \"%s\")" s)))))
+                ;; ——— () —————————————————————
+                (goto-char (point-min))
+                (while (re-search-forward "\\(?:[^\\]\\|^\\)\\(()\\)" nil t)
+                  (unless (lightlispy--in-string-or-comment-p)
+                    (replace-match "(ly-raw empty)" nil nil nil 1)))
+                ;; ——— ? char syntax ——————————
+                (goto-char (point-min))
+                (while (re-search-forward "\\(?:\\s-\\|\\s(\\)\\?" nil t)
+                  (unless (lightlispy--in-string-or-comment-p)
+                    (let ((pt (point))
+                          sexp)
+                      (lightlispy--skip-elisp-char)
+                      (setq sexp (buffer-substring-no-properties pt (point)))
+                      (delete-region (1- pt) (point))
+                      (insert (format "(ly-raw char %S)" sexp)))))
+                ;; ——— \ char syntax (Clojure)—
+                (goto-char (point-min))
+                (while (re-search-forward "\\\\\\(\\sw\\|space\\|tab\\)\\b" nil t)
+                  (unless (lightlispy--in-string-or-comment-p)
+                    (replace-match (format "(ly-raw clojure-char %S)"
+                                           (substring-no-properties
+                                            (match-string 0)))
+                                   nil t)))
+                ;; ——— \ char syntax (LISP)————
+                (goto-char (point-min))
+                (while (re-search-forward "#\\\\\\(.\\)" nil t)
+                  (unless (lightlispy--in-string-or-comment-p)
+                    (replace-match (format "(ly-raw lisp-char %S)"
+                                           (substring-no-properties
+                                            (match-string 0)))
+                                   nil t)))
+                ;; ——— Clojure gensym —————————
+                (goto-char (point-min))
+                (while (re-search-forward "\\([a-zA-Z][a-zA-z-/_0-9]*#\\)" nil t)
+                  (unless (lightlispy--in-string-or-comment-p)
+                    (replace-match (format "(ly-raw clojure-gensym %S)"
+                                           (match-string-no-properties 1)))))
+                ;; ——— #' —————————————————————
+                (goto-char (point-min))
+                (while (re-search-forward "#'" nil t)
+                  (unless (lightlispy--in-string-or-comment-p)
+                    (forward-sexp)
+                    (insert ")")
+                    (replace-match "(ly-raw function ")))
+                ;; ——— ,@ —————————————————————
+                (goto-char (point-min))
+                (while (re-search-forward "\\(?:[^\\]\\|^\\),@" nil t)
+                  (unless (lightlispy--in-string-or-comment-p)
+                    (backward-char 2)
+                    (let ((beg (point))
+                          (sxp (ignore-errors (read (current-buffer)))))
+                      (when (and (consp sxp)
+                                 (eq (car sxp) '\,@))
+                        (insert ")")
+                        (goto-char beg)
+                        (delete-char 2)
+                        (insert "(ly-raw comma-splice ")))))
+                ;; ——— #_ —————————————————————
+                (goto-char (point-min))
+                (while (re-search-forward "#_[({[]" nil t)
+                  (backward-char 1)
+                  (let ((beg (point)))
+                    (forward-list 1)
+                    (insert ")")
+                    (goto-char beg)
+                    (delete-char -2)
+                    (insert "(ly-raw clojure-reader-comment ")))
+                ;; ——— #{ or { or #( or @( or #?( or #?@( ——————————
+                (goto-char (point-min))
+                (while (re-search-forward "#object\\[\\|#\\?@(\\|@(\\|#(\\|{\\|#{\\|#::{\\|#\\?(" nil t)
+                  (let ((class
+                         (cond ((string= (match-string 0) "#{")
+                                "clojure-set")
+                               ((string= (match-string 0) "{")
+                                "clojure-map")
+                               ((string= (match-string 0) "#(")
+                                "clojure-lambda")
+                               ((string= (match-string 0) "@(")
+                                "clojure-deref-list")
+                               ((string= (match-string 0) "#?@(")
+                                "clojure-reader-conditional-splice")
+                               ((string= (match-string 0) "#?(")
+                                "clojure-reader-conditional")
+                               ((string= (match-string 0) "#::{")
+                                "clojure-namespaced-map")
+                               ((string= (match-string 0) "#object[")
+                                "clojure-object")
+                               (t
+                                (error "Unexpected class %s" (match-string 0))))))
+                    (unless (lightlispy--in-string-or-comment-p)
+                      (backward-char 1)
+                      (save-excursion
+                        (if (save-match-data
+                              (looking-at "((ly-raw string"))
+                            (forward-list 1)
+                          (with-syntax-table lightlispy--braces-table
+                            (forward-list 1)))
+                        (delete-char -1)
+                        (insert "))"))
+                      (delete-region (match-beginning 0) (match-end 0))
+                      (insert "(ly-raw " class " ("))))
+                ;; ——— #1 —————————————————————
+                ;; Elisp syntax for circular lists
+                (goto-char (point-min))
+                (while (re-search-forward "\\(?:^\\|\\s-\\|\\s(\\)\\(#[0-9]+\\)" nil t)
+                  (unless (lightlispy--in-string-p)
+                    (replace-match (format "(ly-raw reference %S)"
+                                           (substring-no-properties
+                                            (match-string 1)))
+                                   nil nil nil 1)))
+                ;; ——— ' ——————————————————————
+                (goto-char (point-min))
+                (while (re-search-forward "'" nil t)
+                  (unless (lightlispy--in-string-or-comment-p)
+                    (backward-char 1)
+                    (let ((beg (point))
+                          (sxp (ignore-errors (read (current-buffer)))))
+                      (when (and (consp sxp)
+                                 (eq (car sxp) 'quote))
+                        (insert ")")
+                        (goto-char beg)
+                        (delete-char 1)
+                        (insert "(ly-raw quote ")))))
+                ;; ——— ` ——————————————————————
+                (goto-char (point-min))
+                (while (re-search-forward "\\(?:[^\\]\\|^\\)`" nil t)
+                  (unless (lightlispy--in-string-or-comment-p)
+                    (cond ((looking-at lightlispy-left)
+                           (delete-char -1)
+                           (insert "(ly-raw \\` ")
+                           (forward-list 1)
+                           (insert ")")
+                           (backward-list 1)
+                           (forward-char 7))
+                          ((looking-at "\\sw\\|\\s_\\|[,@]")
+                           (let ((beg (point)))
+                             (forward-sexp 1)
+                             (insert "\")")
+                             (goto-char (1- beg))
+                             (insert "(ly-raw quasiquote \""))))))
+                ;; ——— , ——————————————————————
+                (lightlispy--replace-regexp-in-code "\\\\," "(ly-raw comma-symbol)")
+                (goto-char (point-min))
+                (while (re-search-forward "[^\\]?,[^@\"]" nil t)
+                  (unless (lightlispy--in-string-or-comment-p)
+                    (backward-char 2)
+                    (if (memq major-mode lightlispy-clojure-modes)
+                        (progn
+                          (delete-char 1)
+                          (insert "(ly-raw clojure-comma)"))
+                      (let ((beg (point))
+                            (sxp (ignore-errors (read (current-buffer)))))
+                        (when (and (consp sxp)
+                                   (eq (car sxp) '\,))
+                          (insert ")")
+                          (goto-char beg)
+                          (delete-char 1)
+                          (insert "(ly-raw \\, "))))))
+                ;; ——— angle syntax —————————
+                ;; used for markers/buffers/windows/overlays
+                (goto-char (point-min))
+                (while (re-search-forward "#<" nil t)
+                  (unless (lightlispy--in-string-or-comment-p)
+                    (delete-region (match-beginning 0) (match-end 0))
+                    (insert "(ly-raw angle \"")
+                    (re-search-forward ">")
+                    (backward-delete-char 1)
+                    (insert "\")")))
+                ;; ——— cons cell syntax ———————
+                (lightlispy--replace-regexp-in-code " \\. " " (ly-raw dot) ")
+                ;; Racket stuff
+                (lightlispy--replace-regexp-in-code "#t" "(ly-raw racket-true)")
+                (lightlispy--replace-regexp-in-code "#f" "(ly-raw racket-false)")
+                (goto-char (point-min))
+                (while (re-search-forward "#:\\(\\(?:\\sw\\|\\s_\\)+\\)" nil t)
+                  (unless (lightlispy--in-string-or-comment-p)
+                    (replace-match (format "(ly-raw racket-option %s)"
+                                           (match-string 1)))))
+                ;; Clojure # in a symbol
+                (goto-char (point-min))
+                (while (re-search-forward "\\_<\\(?:\\sw\\|\\s_\\)+\\_>" nil t)
+                  (unless (lightlispy--in-string-p)
+                    (when (cl-position ?# (match-string 0))
+                      (let* ((bnd (lightlispy--bounds-dwim))
+                             (str (lightlispy--string-dwim bnd)))
+                        (delete-region (car bnd) (cdr bnd))
+                        (insert (format "(ly-raw symbol %S)" str))))))
+                ;; Clojure (. object method)
+                (goto-char (point-min))
+                (while (re-search-forward "(\\.[\t\n ]" nil t)
+                  (if (setq cbnd (lightlispy--bounds-string))
+                      (goto-char (cdr cbnd))
+                    (forward-char -1)
+                    (delete-char -1)
+                    (insert "(ly-raw clojure-dot)")))
+                ;; ———  ———————————————————————
+                (buffer-substring-no-properties
+                 (point-min)
+                 (point-max)))))
+    (ignore-errors
+      (read str))))
+
+(defun lightlispy--insert (expr)
+  "Insert the EXPR read by `lightlispy--read'."
+  (let ((start-pt (point))
+        beg
+        sxp type)
+    (prin1 expr (current-buffer))
+    (save-restriction
+      (narrow-to-region start-pt (point))
+      (goto-char (point-min))
+      (while (and (re-search-forward "(ly-raw" nil t)
+                  (setq beg (match-beginning 0)))
+        (goto-char beg)
+        (setq sxp (ignore-errors (read (current-buffer))))
+        (setq type (cadr sxp))
+        (cl-case type
+          (newline
+           (delete-region beg (point))
+           (delete-char
+            (- (skip-chars-backward " ")))
+           (insert "\n"))
+          ((string comment symbol float quasiquote)
+           (delete-region beg (point))
+           (insert (cl-caddr sxp)))
+          (comma-symbol
+           (delete-region beg (point))
+           (insert "\\,"))
+          (ignore
+           (delete-region beg (point))
+           (backward-delete-char 1))
+          (raw
+           (delete-region beg (point))
+           (prin1 (cons 'ly-raw (cddr sxp))
+                  (current-buffer))
+           (backward-list)
+           (forward-char 7))
+          (quote
+           (delete-region beg (point))
+           (insert "'")
+           (let ((it (cl-caddr sxp)))
+             (if it
+                 (prin1 it (current-buffer))
+               (insert "()")))
+           (goto-char beg))
+          (empty
+           (delete-region beg (point))
+           (insert "()"))
+          (char
+           (delete-region beg (point))
+           (insert "?" (cl-caddr sxp)))
+          (clojure-char
+           (delete-region beg (point))
+           (insert (cl-caddr sxp)))
+          (lisp-char
+           (delete-region beg (point))
+           (insert (cl-caddr sxp)))
+          (lisp-macro
+           (delete-region beg (point))
+           (insert (cl-caddr sxp)))
+          (clojure-gensym
+           (delete-region beg (point))
+           (insert (cl-caddr sxp)))
+          (function
+           (delete-region beg (point))
+           (insert (format "#'%S" (cl-caddr sxp)))
+           (goto-char beg))
+          (clojure-dot
+           (delete-region beg (point))
+           (insert "."))
+          (clojure-lambda
+           (delete-region beg (point))
+           (insert (format "#%S" (cl-caddr sxp)))
+           (goto-char beg))
+          (clojure-set
+           (delete-region beg (point))
+           (insert (format "#{%s}" (lightlispy--splice-to-str (cl-caddr sxp))))
+           (goto-char beg))
+          (clojure-map
+           (delete-region beg (point))
+           (insert (format "{%s}" (lightlispy--splice-to-str (cl-caddr sxp))))
+           (goto-char beg))
+          (clojure-object
+           (delete-region beg (point))
+           (insert (format "#object[%s]" (lightlispy--splice-to-str (cl-caddr sxp))))
+           (goto-char beg))
+          (clojure-namespaced-map
+           (delete-region beg (point))
+           (insert (format "#::{%s}" (lightlispy--splice-to-str (cl-caddr sxp))))
+           (goto-char beg))
+          (clojure-deref-list
+           (delete-region beg (point))
+           (insert (format "@(%s)" (lightlispy--splice-to-str (cl-caddr sxp))))
+           (goto-char beg))
+          (clojure-reader-conditional-splice
+           (delete-region beg (point))
+           (insert (format "#?@(%s)" (lightlispy--splice-to-str (cl-caddr sxp))))
+           (goto-char beg))
+          (clojure-reader-conditional
+           (delete-region beg (point))
+           (insert (format "#?(%s)" (lightlispy--splice-to-str (cl-caddr sxp))))
+           (goto-char beg))
+          (clojure-reader-comment
+           (delete-region beg (point))
+           (insert (format "#_%S" (cl-caddr sxp)))
+           (goto-char beg))
+          (clojure-comma
+           (delete-region beg (point))
+           (delete-horizontal-space)
+           (insert ", "))
+          (racket-true
+           (delete-region beg (point))
+           (insert "#t"))
+          (racket-false
+           (delete-region beg (point))
+           (insert "#f"))
+          (racket-option
+           (delete-region beg (point))
+           (insert (format "#:%S" (cl-caddr sxp))))
+          (angle
+           (delete-region beg (point))
+           (insert (format "#<%s>" (cl-caddr sxp)))
+           (goto-char beg))
+          (reference
+           (delete-region beg (point))
+           (insert (cl-caddr sxp)))
+          (\`
+           (if (> (length sxp) 3)
+               (progn
+                 (goto-char beg)
+                 (insert "`")
+                 (delete-region (+ (point) 1)
+                                (+ (point) 11)))
+             (delete-region beg (point))
+             (insert "`")
+             (prin1 (cl-caddr sxp) (current-buffer)))
+           (goto-char beg))
+          (\,
+           (delete-region beg (point))
+           (insert ",")
+           (prin1 (cl-caddr sxp) (current-buffer))
+           (goto-char beg))
+          (comma-splice
+           (delete-region beg (point))
+           (insert ",@")
+           (prin1 (cl-caddr sxp) (current-buffer))
+           (goto-char beg))
+          (dot
+           (delete-region beg (point))
+           (insert "."))
+          (t (goto-char (1+ beg)))))
+      (goto-char (point-min))
+      (while (re-search-forward "\\(?:\\s_\\|\\sw\\)\\(\\\\\\?\\)" nil t)
+        (replace-match "?" t t nil 1))
+      (goto-char (point-min))
+      (while (re-search-forward "\\\\\\." nil t)
+        (unless (save-match-data
+                  (lightlispy--in-string-p))
+          (replace-match ".")))
+      (goto-char (point-min))
+      (while (re-search-forward "[0-9]+\\(\\\\#\\)" nil t)
+        (replace-match "#" nil t nil 1))
+      (when lightlispy-do-fill
+        (goto-char (point-min))
+        (while (re-search-forward " " nil t)
+          (cond ((lightlispy--in-string-p))
+
+                ((lightlispy--in-comment-p)
+                 (fill-paragraph)
+                 (goto-char (cdr (lightlispy--bounds-comment))))
+
+                ((> (current-column) fill-column)
+                 (newline-and-indent)))))
+      (goto-char (point-max))
+      (widen)))
+  (when (and (lightlispy-right-p)
+             (not (lightlispy--in-comment-p)))
+    (backward-list)
+    (indent-sexp)
+    (forward-list)))
+
 (defun lightlispy-define-key (keymap key def &rest plist)
   "Forward to (`define-key' KEYMAP KEY FUNC).
 FUNC is obtained from (`lightlispy--insert-or-call' DEF PLIST)."
@@ -1189,6 +2303,8 @@ FUNC is obtained from (`lightlispy--insert-or-call' DEF PLIST)."
 (defvar lightlispy-mode-map (make-sparse-keymap))
 (defvar lightlispy-mode-map-special
   (let ((map (make-sparse-keymap)))
+
+    ;; From special lispy-mode-map-special
     (lightlispy-define-key map "l" 'lightlispy-right)
     (lightlispy-define-key map "h" 'lightlispy-left)
     (lightlispy-define-key map "f" 'lightlispy-flow)
@@ -1201,7 +2317,18 @@ FUNC is obtained from (`lightlispy--insert-or-call' DEF PLIST)."
     (lightlispy-define-key map "r" 'lightlispy-raise)
     (lightlispy-define-key map "R" 'lightlispy-raise-some)
     (lightlispy-define-key map "+" 'lightlispy-join)
-    (lightlispy-define-key map "]" 'lightlispy-forward)
+
+    ;; from lispy-mode-map-base
+    (define-key map (kbd "C-k") 'lightlispy-kill)
+    (define-key map (kbd "M-d") 'lightlispy-kill-word)
+    (define-key map (kbd "M-DEL") 'lightlispy-backward-kill-word) 
+    (define-key map (kbd "(") 'lightlispy-parens)
+    (define-key map (kbd ";") 'lispy-comment)
+    
+    ;; from lispy-mode-map-lispy
+    (lightlispy-define-key map "[" 'lightlispy-forward)
+    (lightlispy-define-key map "]" 'lightlispy-backward) 
+    
     map))
 
 ;; !!!! TODO -> Someday we might want to add the themes
