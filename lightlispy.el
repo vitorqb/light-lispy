@@ -814,6 +814,51 @@ the end of the line where that list ends."
          (lightlispy-dotimes arg
            (lightlispy--barf-forward)))))
 
+(defun lightlispy-splice (arg)
+  "Splice ARG sexps into containing list."
+  (interactive "p")
+  (lightlispy-dotimes arg
+    (let ((bnd (lispy--bounds-dwim))
+          (deactivate-mark nil))
+      (cond ((region-active-p)
+             (save-excursion
+               (goto-char (cdr bnd))
+               (re-search-backward lispy-right)
+               (delete-region (point) (cdr bnd)))
+             (save-excursion
+               (goto-char (car bnd))
+               (re-search-forward lispy-left)
+               (delete-region (car bnd) (point))))
+            ((lispy-splice-let))
+
+            ((lispy-left-p)
+             (save-excursion
+               (goto-char (cdr bnd))
+               (delete-char -1))
+             (lispy--delete-leading-garbage)
+             (delete-char 1)
+             (lispy-forward 1)
+             (lispy-backward 1))
+
+            ((lispy-right-p)
+             (setq bnd (lispy--bounds-dwim))
+             (delete-char -1)
+             (goto-char (car bnd))
+             (let ((pt (point)))
+               (re-search-forward lispy-left nil t)
+               (delete-region pt (point)))
+             (lispy-backward 1)
+             (forward-list))
+
+            (t
+             (setq bnd (lispy--bounds-list))
+             (save-excursion
+               (goto-char (cdr bnd))
+               (delete-char -1))
+             (save-excursion
+               (goto-char (car bnd))
+               (delete-char 1)))))))
+
 (defun lightlispy-down (arg)
   "Move down ARG times inside current list."
   (interactive "p")
@@ -878,6 +923,73 @@ the end of the line where that list ends."
         (t
          (lightlispy-forward 1)
          (lightlispy-backward 1)))
+  (lightlispy--ensure-visible))
+
+(defun lightlispy-up (arg)
+  "Move up ARG times inside current list."
+  (interactive "p")
+  (lightlispy--remember)
+  (cond ((region-active-p)
+         (let ((leftp (= (point) (region-beginning))))
+           (unless leftp
+             (exchange-point-and-mark))
+           (cond ((save-excursion
+                    (skip-chars-backward "\n ")
+                    (bobp)))
+                 ((looking-back "^ *\\(;\\)[^\n]*[\n ]*"
+                                (save-excursion
+                                  (ignore-errors
+                                    (backward-sexp 1))
+                                  (point)))
+                  (deactivate-mark)
+                  (goto-char (match-beginning 1))
+                  (lightlispy--mark (lightlispy--bounds-comment))
+                  (exchange-point-and-mark))
+                 ((lightlispy--symbolp (lightlispy--string-dwim))
+                  (lightlispy-dotimes arg
+                    (when (lightlispy-slurp 1)
+                      (lightlispy-different)
+                      (lightlispy-barf 1)
+                      (lightlispy-different))))
+                 (t
+                  (lightlispy-dotimes arg
+                    (backward-sexp 1)
+                    (lightlispy-different)
+                    (if (lightlispy--in-comment-p)
+                        (progn
+                          (goto-char (1- (car (lightlispy--bounds-comment))))
+                          (skip-chars-backward "\n"))
+                      (backward-sexp 2)
+                      (backward-sexp -1))
+                    (lightlispy-different))))
+           (unless leftp
+             (exchange-point-and-mark))))
+
+        ((lightlispy-left-p)
+         (let ((pt (point)))
+           (unless (lightlispy-backward arg)
+             (goto-char pt))))
+
+        ((lightlispy-right-p)
+         (lightlispy-backward arg)
+         (let ((pt (point)))
+           (if (lightlispy-backward 1)
+               (lightlispy-forward 1)
+             (goto-char pt)
+             (lightlispy-different))))
+
+        ((or (looking-at lightlispy-outline)
+             (and (bolp) (looking-at ";")))
+         (let ((pt (point)))
+           (lightlispy-dotimes arg
+             (outline-previous-visible-heading 1)
+             (if (looking-at lightlispy-outline)
+                 (setq pt (point))
+               (goto-char pt)
+               (error "First outline reached")))))
+        (t
+         (lightlispy-backward 1)
+         (lightlispy-forward 1)))
   (lightlispy--ensure-visible))
 
 (defun lightlispy--bounds-dwim ()
@@ -964,6 +1076,11 @@ FUNC is obtained from (`lightlispy--insert-or-call' DEF PLIST)."
     (lightlispy-define-key map "h" 'lightlispy-left)
     (lightlispy-define-key map "f" 'lightlispy-flow)
     (lightlispy-define-key map "j" 'lightlispy-down)
+    (lightlispy-define-key map "k" 'lightlispy-up)
+    (lightlispy-define-key map "d" 'lightlispy-different)
+    (lightlispy-define-key map ">" 'lightlispy-slurp)
+    (lightlispy-define-key map "<" 'lightlispy-barf)
+    (lightlispy-define-key map "/" 'lightlispy-splice)
     (lightlispy-define-key map "]" 'lightlispy-forward)
     map))
 
