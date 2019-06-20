@@ -680,6 +680,37 @@ Do so ARG times."
       (unless (eq leftp (lightlispy--leftp))
         (lightlispy-different)))))
 
+(defun lightlispy-raise-some ()
+  "Use current sexps as replacement for their parent.
+The outcome when ahead of sexps is different from when behind."
+  (interactive)
+  (let ((pt (point)))
+    (cond ((region-active-p))
+
+          ((lightlispy-left-p)
+           (if (null (lightlispy--out-forward 1))
+               (progn
+                 (goto-char pt)
+                 (lightlispy-complain "Not enough depth to raise"))
+             (backward-char 1)
+             (set-mark (point))
+             (goto-char pt)))
+
+          ((lightlispy-right-p)
+           (if (null (lightlispy--out-forward 1))
+               (progn
+                 (goto-char pt)
+                 (lightlispy-complain "Not enough depth to raise"))
+             (backward-list)
+             (forward-char 1)
+             (set-mark (point))
+             (goto-char pt)))
+
+          (t
+           (error "Unexpected")))
+    (lightlispy-raise 1)
+    (deactivate-mark)))
+
 (defun lightlispy--insert-or-call (def plist)
   "Return a lambda to call DEF if position is special.
 Otherwise call `self-insert-command'.
@@ -1129,6 +1160,7 @@ FUNC is obtained from (`lightlispy--insert-or-call' DEF PLIST)."
     (lightlispy-define-key map "<" 'lightlispy-barf)
     (lightlispy-define-key map "/" 'lightlispy-splice)
     (lightlispy-define-key map "r" 'lightlispy-raise)
+    (lightlispy-define-key map "R" 'lightlispy-raise-some)
     (lightlispy-define-key map "]" 'lightlispy-forward)
     map))
 
