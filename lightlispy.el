@@ -110,6 +110,18 @@ Otherwise return the amount of times executed."
        (back-to-indentation))
      out))
 
+(defmacro lightlispy-from-left (&rest body)
+  "Ensure that BODY is executed from start of list."
+  (let ((at-start (cl-gensym "at-start")))
+    `(let ((,at-start (lightlispy--leftp)))
+       (unless ,at-start
+         (lightlispy-different))
+       (unwind-protect
+            (lispy-save-excursion
+              ,@body)
+         (unless (eq ,at-start (lightlispy--leftp))
+           (lightlispy-different))))))
+
 (defun lightlispy-bolp ()
   "Return t if point is at beginning of line, after optional spaces."
   (save-excursion
@@ -146,6 +158,13 @@ Otherwise return the amount of times executed."
     (when (or (eq (char-after beg) ?\")
               (nth 4 sp))
       beg)))
+
+(defun lightlispy--leftp ()
+  "Return t if at region beginning, or at start of the list."
+  (if (region-active-p)
+      (= (point) (region-beginning))
+    (or (lightlispy-left-p)
+        (looking-at lightlispy-outline))))
 
 (defun lightlispy-after-string-p (str)
   "Return t if the string before point is STR."
@@ -633,6 +652,34 @@ If couldn't move backward at least once, move up backward and return nil."
                (up-list -1)))))
       (point))))
 
+(defun lightlispy-raise (arg)
+  "Use current sexp or region as replacement for its parent.
+Do so ARG times."
+  (interactive "p")
+  (lightlispy-dotimes arg
+    (let ((regionp (region-active-p))
+          (leftp (lightlispy--leftp))
+          (deactivate-mark nil)
+          bnd1 bnd2)
+      ;; re-indent first
+      (lightlispy-save-excursion (lightlispy--out-forward 1))
+      (unless leftp
+        (lightlispy-different))
+      (setq bnd1 (lightlispy--bounds-dwim))
+      (deactivate-mark)
+      (lightlispy--out-forward 1)
+      (setq bnd2 (lightlispy--bounds-dwim))
+      (delete-region (cdr bnd2) (cdr bnd1))
+      (delete-region (car bnd2) (car bnd1))
+      (if regionp
+          (progn
+            (indent-region (car bnd2) (point))
+            (lightlispy--mark (cons (car bnd2) (point))))
+        (lightlispy-from-left
+         (indent-sexp)))
+      (unless (eq leftp (lightlispy--leftp))
+        (lightlispy-different)))))
+
 (defun lightlispy--insert-or-call (def plist)
   "Return a lambda to call DEF if position is special.
 Otherwise call `self-insert-command'.
@@ -1081,6 +1128,7 @@ FUNC is obtained from (`lightlispy--insert-or-call' DEF PLIST)."
     (lightlispy-define-key map ">" 'lightlispy-slurp)
     (lightlispy-define-key map "<" 'lightlispy-barf)
     (lightlispy-define-key map "/" 'lightlispy-splice)
+    (lightlispy-define-key map "r" 'lightlispy-raise)
     (lightlispy-define-key map "]" 'lightlispy-forward)
     map))
 
