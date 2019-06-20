@@ -835,6 +835,45 @@ the end of the line where that list ends."
                    (lightlispy--slurp-backward))))))
     (lightlispy--reindent)))
 
+(defun lightlispy-join ()
+  "Join sexps."
+  (interactive)
+  (let ((pt (point))
+        bnd)
+    (cond ((lightlispy-right-p)
+           (when (lightlispy-forward 1)
+             (backward-list)
+             (delete-char 1)
+             (goto-char pt)
+             (backward-delete-char 1)
+             (lightlispy--out-forward 1)
+             (lightlispy--reindent 1)))
+          ((lightlispy-left-p)
+           (when (lightlispy-backward 1)
+             (forward-list)
+             (backward-delete-char 1)
+             (goto-char (1- pt))
+             (delete-char 1)
+             (lightlispy-save-excursion
+               (forward-char 1)
+               (lightlispy-left 2)
+               (lightlispy--normalize-1))))
+          ((and (setq bnd (lightlispy--bounds-string))
+                (or (save-excursion
+                      (goto-char (car bnd))
+                      (skip-chars-backward " \t\n")
+                      (when (eq (char-before) ?\")
+                        (delete-region (1- (point))
+                                       (1+ (car bnd)))
+                        t))
+                    (save-excursion
+                      (goto-char (cdr bnd))
+                      (skip-chars-forward " \t\n")
+                      (when (looking-at "\"")
+                        (delete-region (1- (cdr bnd))
+                                       (1+ (point)))
+                        t))))))))
+
 (defun lightlispy-barf (arg)
   "Shrink current sexp or region by ARG sexps."
   (interactive "p")
@@ -1161,6 +1200,7 @@ FUNC is obtained from (`lightlispy--insert-or-call' DEF PLIST)."
     (lightlispy-define-key map "/" 'lightlispy-splice)
     (lightlispy-define-key map "r" 'lightlispy-raise)
     (lightlispy-define-key map "R" 'lightlispy-raise-some)
+    (lightlispy-define-key map "+" 'lightlispy-join)
     (lightlispy-define-key map "]" 'lightlispy-forward)
     map))
 
