@@ -28,12 +28,12 @@
 ;; ***********************************
 ;;    *DISCLAIMER*
 ;; 
-;; MOST OF THIS CODE IS FROM https://github.com/abo-abo/lispy/blob/master/lispy.el
+;; ALL OF THIS CODE IS FROM https://github.com/abo-abo/lispy/blob/master/lispy.el
 ;; All credits and rights for the code from the lispy package goes for the
 ;; author, Oleh Krehel.
 ;; ***********************************
 ;;
-;; An extraction from the `abo-abo` `lispy` package containing only
+;; An extraction from the `abo-abo` `lispy` package containing only part of the
 ;; structural editting, without code evaluation.
 
 

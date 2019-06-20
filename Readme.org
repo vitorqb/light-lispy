@@ -1,1 +1,17 @@
-* Light Lispy :)
+* LightLispy
+
+** *DISCLAIMER*
+
+   ALL OF THIS CODE IS FROM https://github.com/abo-abo/lispy/blob/master/lispy.el
+   *All credits and rights for the code goes to the lispy author*.
+
+** Why?
+   
+   Lispy is fantastic. Really. It is amazing.
+
+   But sometimes I wished I had *only* the structural editting that comes
+   with lispy, and nothing else. No magic (even though the magic is great
+   when you need it!)
+
+   So I copied part the part of the code with the structural editting that
+   I actually used here.
