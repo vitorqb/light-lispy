@@ -67,7 +67,7 @@
 (defvar lightlispy-parens-only-left-in-string-or-comment t
   "Whether \"(\" should insert only the left paren in strings and comments.")
 
-(defvar lispy-map-input-overlay nil
+(defvar lightlispy-map-input-overlay nil
   "The input overlay for mapping transformations.")
 
 (defvar lightlispy-brackets-preceding-syntax-alist
@@ -278,7 +278,7 @@ Otherwise return the amount of times executed."
        (unless ,at-start
          (lightlispy-different))
        (unwind-protect
-            (lispy-save-excursion
+            (lightlispy-save-excursion
               ,@body)
          (unless (eq ,at-start (lightlispy--leftp))
            (lightlispy-different))))))
@@ -517,11 +517,11 @@ Only `ly-raw' lists within FOO are manipulated."
          (cons (lightlispy--sexp-normalize
                 (lightlispy--sexp-trim-trailing-newlines (car foo) t))
                (lightlispy--sexp-normalize
-                (lispy--sexp-trim-trailing-newlines (cdr foo) t))))
+                (lightlispy--sexp-trim-trailing-newlines (cdr foo) t))))
         (t
          foo)))
 
-(defun lispy--out-backward (arg)
+(defun lightlispy--out-backward (arg)
   "Move outside list forwards ARG times.
 Return nil on failure, t otherwise."
   (let ((oldpt (point))
@@ -585,7 +585,7 @@ When STEP is non-nil, insert in between each STEP elements instead."
       (unless (equal (car res) x)
         (push x res))
       (unless (equal (car res)
-                     (car (setq item (lispy-multipop lst step))))
+                     (car (setq item (lightlispy-multipop lst step))))
         (setq res (nconc (nreverse item) res))))
     (nreverse res)))
 
@@ -683,7 +683,7 @@ Return nil on failure, t otherwise."
         ((looking-at lightlispy-outline)
          (lightlispy-outline-left))
         (t
-         (or (lispy--out-backward arg)
+         (or (lightlispy--out-backward arg)
              (ignore-errors
                (up-list -1))))))
 
@@ -711,9 +711,9 @@ Return nil on failure, (point) otherwise."
           (if buffer-read-only
               (deactivate-mark)
             (unless lightlispy-ignore-whitespace
-              (lispy--remove-gaps)
-              (lispy--indent-for-tab)))
-        (when (lispy-left-p)
+              (lightlispy--remove-gaps)
+              (lightlispy--indent-for-tab)))
+        (when (lightlispy-left-p)
           (forward-list))
         (throw 'break nil)))
     (point)))
@@ -867,7 +867,7 @@ Return the amount of successful grow steps, nil instead of zero."
   "Return the bounds of smallest list that includes the point."
   (save-excursion
     (lightlispy--exit-string)
-    (when (looking-at lispy-left)
+    (when (looking-at lightlispy-left)
       (forward-char))
     (when (lightlispy-looking-back lightlispy-right)
       (backward-char))
@@ -881,7 +881,7 @@ Return the amount of successful grow steps, nil instead of zero."
 
 (defun lightlispy--maybe-safe-delete-region (beg end)
   "Delete the region from BEG to END.
-If `lispy-safe-delete' is non-nil, exclude unmatched delimiters."
+If `lightlispy-safe-delete' is non-nil, exclude unmatched delimiters."
   (if lightlispy-safe-delete
       (let ((safe-regions (lightlispy--find-safe-regions beg end)))
         (dolist (safe-region safe-regions)
@@ -2125,7 +2125,7 @@ the end of the line where that list ends."
                           (backward-char 1)
                         (throw 'result i))))
                    ((lightlispy--in-comment-p)
-                    (goto-char (cdr (lispy--bounds-comment)))
+                    (goto-char (cdr (lightlispy--bounds-comment)))
                     (if (= (region-beginning) (region-end))
                         (goto-char (car bnd))
                       (skip-chars-forward " \n")))
@@ -2155,40 +2155,40 @@ the end of the line where that list ends."
   "Splice ARG sexps into containing list."
   (interactive "p")
   (lightlispy-dotimes arg
-    (let ((bnd (lispy--bounds-dwim))
+    (let ((bnd (lightlispy--bounds-dwim))
           (deactivate-mark nil))
       (cond ((region-active-p)
              (save-excursion
                (goto-char (cdr bnd))
-               (re-search-backward lispy-right)
+               (re-search-backward lightlispy-right)
                (delete-region (point) (cdr bnd)))
              (save-excursion
                (goto-char (car bnd))
-               (re-search-forward lispy-left)
+               (re-search-forward lightlispy-left)
                (delete-region (car bnd) (point))))
-            ((lispy-splice-let))
+            ((lightlispy-splice-let))
 
-            ((lispy-left-p)
+            ((lightlispy-left-p)
              (save-excursion
                (goto-char (cdr bnd))
                (delete-char -1))
-             (lispy--delete-leading-garbage)
+             (lightlispy--delete-leading-garbage)
              (delete-char 1)
-             (lispy-forward 1)
-             (lispy-backward 1))
+             (lightlispy-forward 1)
+             (lightlispy-backward 1))
 
-            ((lispy-right-p)
-             (setq bnd (lispy--bounds-dwim))
+            ((lightlispy-right-p)
+             (setq bnd (lightlispy--bounds-dwim))
              (delete-char -1)
              (goto-char (car bnd))
              (let ((pt (point)))
-               (re-search-forward lispy-left nil t)
+               (re-search-forward lightlispy-left nil t)
                (delete-region pt (point)))
-             (lispy-backward 1)
+             (lightlispy-backward 1)
              (forward-list))
 
             (t
-             (setq bnd (lispy--bounds-list))
+             (setq bnd (lightlispy--bounds-list))
              (save-excursion
                (goto-char (cdr bnd))
                (delete-char -1))
@@ -2501,7 +2501,7 @@ Otherwise (`backward-delete-char-untabify' ARG)."
                (lightlispy--indent-for-tab))))
 
           ((and (lightlispy-looking-back lightlispy-left)
-                (not (lispy-looking-back "[\\?].")))
+                (not (lightlispy-looking-back "[\\?].")))
            (lightlispy--out-forward 1)
            (lightlispy-delete-backward 1))
 
@@ -3213,13 +3213,13 @@ FUNC is obtained from (`lightlispy--insert-or-call' DEF PLIST)."
     (define-key map (kbd "M-d") 'lightlispy-kill-word)
     (define-key map (kbd "M-DEL") 'lightlispy-backward-kill-word) 
     (define-key map (kbd "(") 'lightlispy-parens)
-    (define-key map (kbd ";") 'lispy-comment)
+    (define-key map (kbd ";") 'lightlispy-comment)
     
     ;; from lispy-mode-map-lispy
     (define-key map "[" 'lightlispy-forward)
     (define-key map "]" 'lightlispy-backward)
     (define-key map (kbd "C-d") 'lightlispy-delete)
-    (define-key map (kbd "DEL") 'lispy-delete-backward)
+    (define-key map (kbd "DEL") 'lightlispy-delete-backward)
     (define-key map (kbd "{") 'lightlispy-braces)
     (define-key map (kbd "}") 'lightlispy-brackets)
     (define-key map (kbd "\"") 'lightlispy-quotes)
@@ -3236,4 +3236,5 @@ for lisps."
   :group 'lightlispy
   :lighter "LLY")
 
+(provide 'lightlispy)
 ;;; orgext.el ends here
