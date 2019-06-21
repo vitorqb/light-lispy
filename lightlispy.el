@@ -295,6 +295,16 @@ Otherwise return the amount of times executed."
               ,@body)
          (fset ',name ,old)))))
 
+(defmacro lightlispy-multipop (lst n)
+  "Remove LST's first N elements and return them."
+  `(if (<= (length ,lst) ,n)
+       (prog1 ,lst
+         (setq ,lst nil))
+     (prog1 ,lst
+       (setcdr
+        (nthcdr (1- ,n) (prog1 ,lst (setq ,lst (nthcdr ,n ,lst))))
+        nil))))
+
 (defun lightlispy-bolp ()
   "Return t if point is at beginning of line, after optional spaces."
   (save-excursion
@@ -563,6 +573,21 @@ or to the beginning of the line."
                               lightlispy-left "\\|"
                               "^"))
   (goto-char (match-end 0)))
+
+(defun lightlispy-interleave (x lst &optional step)
+  "Insert X in between each element of LST.
+Don't insert X when it's already there.
+When STEP is non-nil, insert in between each STEP elements instead."
+  (setq step (or step 1))
+  (let ((res (nreverse (lightlispy-multipop lst step)))
+        item)
+    (while lst
+      (unless (equal (car res) x)
+        (push x res))
+      (unless (equal (car res)
+                     (car (setq item (lispy-multipop lst step))))
+        (setq res (nconc (nreverse item) res))))
+    (nreverse res)))
 
 (defun lightlispy-different ()
   "Switch to the different side of current sexp."
@@ -917,6 +942,23 @@ without recalculation."
               (widen))
           (kill-word 1))))))
 
+(defun lightlispy-move-down (arg)
+  "Move current expression down ARG times.  Don't exit parent list.
+Also works from inside the list."
+  (interactive "p")
+  (if (or (lightlispy-left-p)
+          (lightlispy-right-p)
+          (region-active-p)
+          (looking-at lightlispy-outline))
+      (lightlispy--move-down-special arg)
+    (let ((offset (-
+                   (point)
+                   (progn
+                     (lightlispy--out-backward 1)
+                     (point)))))
+      (lightlispy--move-down-special arg)
+      (forward-char offset))))
+
 (defun lightlispy-mark-left (arg)
   "Go left ARG times and mark."
   (interactive "p")
@@ -924,6 +966,31 @@ without recalculation."
       (lightlispy-different)
     (when (= (point) (region-end))
       (exchange-point-and-mark))))
+
+(defun lightlispy--move-down-special (arg)
+  "Move current expression down ARG times.  Don't exit parent list."
+  (let ((at-start (lightlispy--leftp)))
+    (unless (or at-start (looking-at lightlispy-outline))
+      (lightlispy-different))
+    (cond ((region-active-p)
+           (lightlispy--move-down-region arg))
+          ((looking-at lightlispy-outline)
+           (lightlispy-dotimes arg
+             (let ((bnd1 (lightlispy--bounds-outline))
+                   bnd2)
+               (goto-char (1+ (cdr bnd1)))
+               (if (and (setq bnd2 (lightlispy--bounds-outline))
+                        (not (equal bnd1 bnd2)))
+                   (progn
+                     (lightlispy--swap-regions bnd1 bnd2)
+                     (forward-char (1+ (- (cdr bnd2) (car bnd2)))))
+                 (goto-char (car bnd1))))))
+          (t
+           (lightlispy--mark (lightlispy--bounds-dwim))
+           (lightlispy-move-down arg)
+           (deactivate-mark)
+           (lightlispy-different)))
+    (unless at-start (lightlispy-different))))
 
 (defun lightlispy-mark-right (arg)
   "Go right ARG times and mark."
@@ -998,6 +1065,31 @@ each major mode."
            (lightlispy--out-forward 1)
            (backward-list)
            (indent-sexp)))))
+
+(defun lightlispy--swap-regions (bnd1 bnd2)
+  "Swap buffer regions BND1 and BND2.
+Return a cons of the new text cordinates."
+  (when (> (car bnd1) (car bnd2))
+    (cl-rotatef bnd1 bnd2))
+  (let ((str1 (lightlispy--string-dwim bnd1))
+        (str2 (lightlispy--string-dwim bnd2)))
+    (goto-char (car bnd2))
+    (delete-region (car bnd2) (cdr bnd2))
+    (insert str1)
+    (when (lightlispy--in-comment-p)
+      (unless (eolp)
+        (newline-and-indent)))
+    (goto-char (car bnd1))
+    (delete-region (car bnd1) (cdr bnd1))
+    (insert str2)
+    (goto-char (car bnd1)))
+  (let* ((l1 (- (cdr bnd1) (car bnd1)))
+         (l2 (- (cdr bnd2) (car bnd2)))
+         (new-beg (+ (car bnd2) (- l2 l1)))
+         (new-end (+ new-beg l1)))
+    (cons
+     (cons (car bnd1) (+ (car bnd1) l2))
+     (cons new-beg new-end))))
 
 (defun lightlispy--bounds-comment ()
   "Return bounds of current comment."
@@ -1123,6 +1215,60 @@ each major mode."
                              (point-max))
                 (widen)))
           (backward-kill-word 1))))))
+
+(defun lightlispy--move-down-region (arg)
+  "Swap the marked region ARG positions down.
+Precondition: the region is active and the point is at `region-beginning'."
+  (cond
+    ((and (lightlispy-after-string-p "-")
+          (save-excursion
+            (goto-char (region-end))
+            (looking-at "\\_>"))))
+    ((save-excursion
+       (goto-char (region-end))
+       (looking-at "-"))
+     (let ((bnd1 (lightlispy--bounds-dwim))
+           bnd2)
+       (lightlispy-down arg)
+       (setq bnd2 (lightlispy--bounds-dwim))
+       (lightlispy--swap-regions bnd1 bnd2)
+       (goto-char (cdr bnd2))
+       (setq deactivate-mark nil)
+       (set-mark (point))
+       (forward-char (- (car bnd1) (cdr bnd1)))))
+    ((= arg 1)
+     (let ((bnd1 (lightlispy--bounds-dwim))
+           (bnd0 (save-excursion
+                   (deactivate-mark)
+                   (if (ignore-errors (up-list) t)
+                       (lightlispy--bounds-dwim)
+                     (cons (point-min) (point-max)))))
+           bnd2)
+       (goto-char (cdr bnd1))
+       (if (re-search-forward "[^ \t\n]" (max (1- (cdr bnd0))
+                                              (point)) t)
+           (progn
+             (deactivate-mark)
+             (if (lightlispy--in-comment-p)
+                 (setq bnd2 (lightlispy--bounds-comment))
+               (when (memq (char-before) '(?\( ?\" ?\[ ?\{))
+                 (backward-char))
+               (setq bnd2 (lightlispy--bounds-dwim)))
+             (lightlispy--swap-regions bnd1 bnd2)
+             (setq deactivate-mark nil)
+             (goto-char (cdr bnd2))
+             (set-mark (point))
+             (backward-char (- (cdr bnd1) (car bnd1))))
+         (lightlispy--mark bnd1)
+         (exchange-point-and-mark))))
+    (t
+     (let ((bnd1 (lightlispy--bounds-dwim)))
+       (lightlispy-down arg)
+       (lightlispy--mark
+        (cdr
+         (lightlispy--swap-regions
+          bnd1 (lightlispy--bounds-dwim))))
+       (lightlispy-different)))))
 
 (defun lightlispy-mark-symbol ()
   "Mark current symbol."
@@ -1605,6 +1751,62 @@ When this function is called:
 (defalias 'lightlispy-parens
   (lightlispy-pair "(" ")" 'lightlispy-parens-preceding-syntax-alist)
   "`lightlispy-pair' with ().")
+
+(defun lightlispy-clone (arg)
+  "Clone sexp ARG times.
+When the sexp is top level, insert an additional newline."
+  (interactive "p")
+  (let* ((bnd (lightlispy--bounds-dwim))
+         (str (lightlispy--string-dwim bnd))
+         (pt (point)))
+    (cond ((region-active-p)
+           (lightlispy-dotimes arg
+             (cl-labels
+                 ((doit ()
+                    (let (deactivate-mark)
+                      (save-excursion
+                        (newline)
+                        (insert str)
+                        (lightlispy--indent-for-tab)))))
+               (if (= (point) (region-end))
+                   (doit)
+                 (exchange-point-and-mark)
+                 (doit)
+                 (exchange-point-and-mark)))))
+          ((lightlispy-left-p)
+           (goto-char (car bnd))
+           (cond ((and (bolp) (looking-at "(defun"))
+                  (lightlispy-dotimes arg
+                    (insert str)
+                    (newline)
+                    (newline))
+                  (goto-char pt))
+                 ((and (bolp)
+                       (save-excursion
+                         (goto-char (cdr bnd))
+                         (looking-at "\n;; =>")))
+                  (lightlispy-dotimes arg
+                    (insert str)
+                    (newline-and-indent)
+                    (lightlispy-move-down 1)))
+                 (t
+                  (lightlispy-dotimes arg
+                    (insert str)
+                    (newline-and-indent))
+                  (goto-char pt))))
+          ((lightlispy-right-p)
+           (if (save-excursion
+                 (backward-list)
+                 (and (bolp) (looking-at "(defun")))
+               (lightlispy-dotimes arg
+                 (newline)
+                 (newline-and-indent)
+                 (insert str))
+             (lightlispy-dotimes arg
+               (newline-and-indent)
+               (insert str))))
+          (t
+           (error "Unexpected")))))
 
 (defun lightlispy-kill ()
   "Kill line, keeping parens consistent."
@@ -3004,6 +3206,7 @@ FUNC is obtained from (`lightlispy--insert-or-call' DEF PLIST)."
     (lightlispy-define-key map "r" 'lightlispy-raise)
     (lightlispy-define-key map "R" 'lightlispy-raise-some)
     (lightlispy-define-key map "+" 'lightlispy-join)
+    (lightlispy-define-key map "c" 'lightlispy-clone)
 
     ;; from lispy-mode-map-base
     (define-key map (kbd "C-k") 'lightlispy-kill)
@@ -3016,6 +3219,7 @@ FUNC is obtained from (`lightlispy--insert-or-call' DEF PLIST)."
     (define-key map "[" 'lightlispy-forward)
     (define-key map "]" 'lightlispy-backward)
     (define-key map (kbd "C-d") 'lightlispy-delete)
+    (define-key map (kbd "DEL") 'lispy-delete-backward)
     (define-key map (kbd "{") 'lightlispy-braces)
     (define-key map (kbd "}") 'lightlispy-brackets)
     (define-key map (kbd "\"") 'lightlispy-quotes)
